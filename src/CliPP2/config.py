@@ -58,6 +58,15 @@ def validate_assignment_method(value):
     return value
 
 
+def mixture_fitting_identity(selection=SELECTION_CRITERION, max_multiplicity_difference=1):
+    """Tree-free observed-mixture objective, distinct from legacy group refits."""
+    identity = fitting_identity("marginal", selection, max_multiplicity_difference)
+    identity.update(fit_objective_id="observed_joint_marginal_mixture_v1",
+                    initialization_policy_id="observed_data_mixture_seeds_v1",
+                    scalar_refit_policy_id="soft_joint_em_stationary_v1")
+    return identity
+
+
 def validate_missing_counts(value):
     if value not in ("zero_alt", "unobserved"):
         raise ValueError("missing_counts must be zero_alt or unobserved.")

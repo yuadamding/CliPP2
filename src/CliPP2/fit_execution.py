@@ -12,8 +12,9 @@ from .io.reporting import (ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination,
                            exclusion_summary, public_label_order, publish)
 from .kernel import KERNEL_VERSION, SCORE_DEFINITION
 from .kernel.model import RegionalModel
+from .production import (fit_observations, mixture_execution_diagnostics,
+                         require_supported_production)
 from .tree.progress import ProgressReporter
-from .tree.selection import fit_regions
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
     """Fit, independently verify, and publish prepared ordinary/workflow data."""
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
+    require_supported_production(config)
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError('progress_callback must be callable or None')
     from .provenance import resolve_current_run_manifest_id, validate_fit_execution_receipt
@@ -57,11 +59,8 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
         if progress is not None:
             progress.model = model
             progress.emit(complete=True)
-        fit_offset = perf_counter()-started
-        callback = (None if progress_callback is None else lambda record:
-                    progress_callback(dict(record, elapsed_seconds=record['elapsed_seconds']+fit_offset)))
-        result = fit_regions(model, config.max_clusters, progress_callback=callback)
-        execution_record = model.execution_diagnostics()
+        result = fit_observations(model, config.max_clusters, progress=progress)
+        execution_record = mixture_execution_diagnostics(model)
         validate_fit_execution_receipt(asdict(config), execution_record, build=build)
         verification_start = perf_counter()
         publication = publish(model, result, outdir, data.tumor_id, progress=progress)
@@ -78,21 +77,21 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'num_mutations': model.n, 'num_regions': model.r,
             'num_clusters': len(result.centers), 'region_ids': model.region_ids,
             'fit_config': asdict(config), 'model_identity': model.identity,
-            'method_identity': dict(model.method_identity),
+            'method_identity': dict(result.selected.fit.method_identity),
             'fitting_log_likelihood': result.selected.fit.fitting_log_likelihood,
             'multiplicity_support': None if multiplicity_support is None else {
                 'policy_id': multiplicity_support.policy_id, 'content_hash': multiplicity_support.content_hash},
             'score': result.score, 'score_definition': SCORE_DEFINITION,
             'clonal_constraint': False, 'cluster_zero': 'largest_final_ccf_l2_norm',
             'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
-            'execution': model.execution_diagnostics(),
-            'search_status': {'policy': result.diagnostics['search_policy'],
+            'execution': mixture_execution_diagnostics(model),
+            'positive_components': result.selected.fit.positive_components,
+            'occupied_map_clusters': result.selected.fit.occupied_map_clusters,
+            'search_status': {'policy': ALGORITHM,
                 'selected_q': len(result.centers), 'selected_state_id': result.selected.state_index,
-                'represented_cluster_counts': sorted({len(candidate.fit.centers) for candidate in result.candidate_bank}),
-                'search_work': result.diagnostics['search_work'],
-                'recurring_search': {key: result.diagnostics['reassignment'][key] for key in (
-                    'status', 'exhaustion_scope', 'proposal_limit', 'proposal_slots',
-                    'operator_slots', 'remaining_frontier_states')},
+                'represented_cluster_counts': sorted({candidate.positive_components for candidate in result.search.candidates}),
+                'search_work': dict(result.diagnostics),
+                'occupied_map_count_is_component_count': False,
                 'local_optimality_certified': False, 'global_optimality_certified': False},
             'input_seconds': input_seconds,
             'verification_publication_seconds': perf_counter()-verification_start,

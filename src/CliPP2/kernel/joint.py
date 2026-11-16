@@ -196,13 +196,113 @@ def joint_row(alt, depth, scaling, minimum, maximum, observed, phi, *, max_multi
 
 def joint_log_columns(alt, depth, scaling, minimum, maximum, observed, centers, *,
                       max_multiplicity_difference=1, aggregation="marginal"):
-    """Reconstruct N-by-K columns independently of native caches and emissions."""
+    """Likelihood-only N-by-K oracle, independent of native caches/emissions.
+
+    The range-one DP partitions assignments by their smallest multiplicity.
+    Its two states record whether that anchor has occurred. Vectorizing over
+    mutations and centers avoids the MAP/tie/cavity work in ``joint_row``;
+    that separate diagnostic oracle remains unchanged. Only O(N*K) workspace
+    is needed, and the structural normalizer is evaluated once per row.
+    """
+    validate_max_multiplicity_difference(max_multiplicity_difference)
     if aggregation not in ("marginal", "profile"):
         raise ValueError("Unknown likelihood aggregation")
-    result = np.empty((len(alt), len(centers)))
-    field = "log_marginal" if aggregation == "marginal" else "profile"
-    for i in range(len(alt)):
-        for k, center in enumerate(centers):
-            result[i, k] = joint_row(alt[i], depth[i], scaling[i], minimum[i], maximum[i],
-                observed[i], center, max_multiplicity_difference=max_multiplicity_difference)[field]
+    alt, depth, scaling, minimum, maximum, observed = (
+        np.asarray(value) for value in (alt, depth, scaling, minimum, maximum, observed))
+    centers = np.asarray(centers, dtype=float)
+    if (alt.ndim != 2 or any(value.shape != alt.shape for value in
+            (depth, scaling, minimum, maximum, observed)) or centers.ndim != 2
+            or centers.shape[1] != alt.shape[1]):
+        raise ValueError("Joint columns require aligned N-by-R inputs and K-by-R centers")
+    observed = observed.astype(bool)
+    if (not np.isfinite(minimum).all() or not np.isfinite(maximum).all()
+            or np.any(minimum < 1) or np.any(maximum < minimum)
+            or np.any(minimum != np.floor(minimum)) or np.any(maximum != np.floor(maximum))):
+        raise ValueError("Multiplicity supports require nonempty positive integer intervals")
+    used_centers = centers[:, observed.any(axis=0)]
+    if (not np.isfinite(used_centers).all()
+            or np.any((used_centers < 0) | (used_centers > 1))):
+        raise ValueError("Observed CCFs must be finite and in [0, 1]")
+    if (any(not np.isfinite(value[observed]).all() for value in (alt, depth, scaling))
+            or np.any(alt[observed] < 0) or np.any(depth[observed] < alt[observed])
+            or np.any(scaling[observed] < 0)):
+        raise ValueError("Observed reads and scaling must be finite valid binomial inputs")
+    n, regions = alt.shape
+    result = np.zeros((n, len(centers)))
+    if not observed.any() or not len(centers):
+        return result
+    # Match raw_binomial_components' constant reconstruction, including its
+    # prior-removal arithmetic. Missing observations are never evaluated.
+    constant = np.zeros_like(alt, dtype=float)
+    y, d = alt[observed], depth[observed]
+    width_log = np.log(maximum[observed]-minimum[observed]+1)
+    constant[observed] = gammaln(d+1)-gammaln(y+1)-gammaln(d-y+1)-width_log
+    constant[observed] += width_log
+    reference = depth-alt
+
+    def component(rows, region, multiplicity):
+        probability = np.minimum(1., scaling[rows, region, None] * multiplicity
+                                 * centers[None, :, region])
+        return (xlogy(alt[rows, region, None], probability)
+                + xlog1py(reference[rows, region, None], -probability)
+                + constant[rows, region, None])
+
+    combine = np.logaddexp if aggregation == "marginal" else np.maximum
+    if max_multiplicity_difference is None:
+        for region in range(regions):
+            rows = np.flatnonzero(observed[:, region])
+            if not len(rows):
+                continue
+            mass = np.full((len(rows), len(centers)), -np.inf)
+            width = maximum[rows, region]-minimum[rows, region]+1
+            for offset in range(int(width.max())):
+                live = np.flatnonzero(offset < width)
+                values = component(rows[live], region, minimum[rows[live], region, None]+offset)
+                mass[live] = combine(mass[live], values)
+            if aggregation == "marginal":
+                mass -= np.log(width)[:, None]
+            result[rows] += mass
+        return result
+
+    active = observed.any(axis=1)
+    # Only these anchors can produce a complete assignment for each row.
+    first = np.maximum(1, np.max(np.where(observed, minimum, 1), axis=1)-1)
+    last = np.min(np.where(observed, maximum, np.inf), axis=1)
+    if np.any(first[active] > last[active]):
+        raise ValueError("Empty joint multiplicity support")
+    result[active] = -np.inf
+    log_count = np.full(n, -np.inf)
+    for anchor in range(int(first[active].min()), int(last[active].max())+1):
+        rows = np.flatnonzero(active & (first <= anchor) & (anchor <= last))
+        if not len(rows):
+            continue
+        absent = np.zeros((len(rows), len(centers)))
+        present = np.full_like(absent, -np.inf)
+        count_absent = np.zeros(len(rows))
+        count_present = np.full(len(rows), -np.inf)
+        for region in range(regions):
+            local = np.flatnonzero(observed[rows, region])
+            source = rows[local]
+            if not len(local):
+                continue
+            supports_anchor = (minimum[source, region] <= anchor) & (anchor <= maximum[source, region])
+            supports_next = ((minimum[source, region] <= anchor+1)
+                             & (anchor+1 <= maximum[source, region]))
+            x = np.where(supports_anchor[:, None], component(source, region, anchor), -np.inf)
+            y = np.where(supports_next[:, None], component(source, region, anchor+1), -np.inf)
+            present[local] = combine(present[local] + combine(x, y), absent[local]+x)
+            absent[local] += y
+            if aggregation == "marginal":
+                x_count = np.where(supports_anchor, 0., -np.inf)
+                y_count = np.where(supports_next, 0., -np.inf)
+                count_present[local] = np.logaddexp(
+                    count_present[local]+np.logaddexp(x_count, y_count), count_absent[local]+x_count)
+                count_absent[local] += y_count
+        result[rows] = combine(result[rows], present)
+        if aggregation == "marginal":
+            log_count[rows] = np.logaddexp(log_count[rows], count_present)
+    if aggregation == "marginal":
+        if not np.isfinite(log_count[active]).all():
+            raise ValueError("Empty joint multiplicity support")
+        result[active] -= log_count[active, None]
     return result

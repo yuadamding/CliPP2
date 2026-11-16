@@ -17,11 +17,14 @@ this consolidated reference set. Native fit records remain unchanged as provenan
 
 Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
 has no automatic eligibility ceiling. Explicit input exclusions, model-domain
-checks and numerical verification remain. Stage 1–2 preserves the tree-search
-winner, then repeatedly explores general-partition births, transfers of both
-signs, merges and atomic split–merge moves under the same refitter and BIC.
-The bounded search reports budget or proposal exhaustion; neither certifies
-local or global optimality. It does not run exhaustive membership audits.
+checks and numerical verification remain. New Stage 1–2 fits start directly
+from observation-derived seeds and jointly optimize marginal-mixture centers
+and weights, without tree search or an accepted-fit initializer. Every distinct
+converged start enters the BIC comparison. Exactly identical centers are
+consolidated; distinct positive-weight components remain even when no mutation
+has that component as its MAP label. Labels do not trigger a hard center refit.
+The bounded birth/transfer/merge/split–merge search is not a local- or
+global-optimality certificate.
 Package **2.2.0** implements scientific protocol **2.5**. The
 [protocol specification](docs/workflow_protocol_2_5.md) defines the likelihood,
 BIC, multiplicity constraints, and saved-state contracts.
@@ -51,19 +54,19 @@ and no data-supported final label; all-impossible candidates instead yield
 | Input audit | `clipp2 audit-input --input-file INPUT.tsv --output AUDIT.json` |
 | Frozen-reference reassignment | `clipp2 assign --bundle BUNDLE.json --output-dir OUTPUT` |
 
-An opt-in **CPU-only research estimator**, separate from the workflow, jointly
-fits mixture centers and weights to observed marginal likelihood:
+The **CPU-only saved-population comparison** command uses the same soft-mixture
+optimizer with independently validated saved marginal centers as its initializer:
 
 ```sh
 clipp2 experiment-mixture --catalog RUN/original_catalog.json \
   --accepted-fit RUN/stage_two_accepted.json --output experiment.json
 ```
 
-It preserves the saved population and support, uses soft responsibilities, and
-reports positive-weight components separately from occupied MAP labels. Its BIC
-counts positive components. The experimental JSON cannot replace an accepted
-workflow fit; no hard refit is performed after MAP labeling. Better likelihood
-or BIC does not establish better biological accuracy or CUDA qualification.
+It preserves the saved population and support and independently verifies its
+selected mixture before publication. Its experimental JSON is not an accepted
+production fit and cannot replace a workflow `AcceptedFit`. Ordinary `fit` and
+`workflow` do not require this command or a saved fit. Better likelihood or BIC
+does not establish better biological accuracy or CUDA qualification.
 
 Stage 3 defaults to **marginal** likelihood. Set
 `workflow_config.stage_three_assignment_method` to `"profile"` to maximize the
@@ -73,22 +76,15 @@ executed bundle with its outputs. Profile ties retain the baseline when it is a
 maximizer; otherwise the lowest label wins. Profile scores are not cluster
 posteriors.
 
-CUDA requires an explicit build and device selection:
-
-```sh
-CLIPP2_BUILD_CUDA=1 python -m pip install .
-clipp2 workflow --help
-```
-
-Set the workflow plan's fit device to `cuda`, or use `clipp2 fit --device cuda`.
-CUDA builds require `nvcc`; execution requires a compatible NVIDIA GPU and driver.
-CPU execution requires neither CUDA nor PyTorch.
-
-Stage 1–2 center fitting defaults to **marginal** likelihood. Opt into
-`--fit-multiplicity profile` (or `workflow_config.fit.fit_multiplicity` in a plan)
-to maximize integer-multiplicity likelihood while retaining marginal-mixture
-BIC selection at the frozen fitted centers. This is independent of Stage 3's
-assignment method. See the [numerical contract](docs/workflow_protocol_2_5.md#joint-likelihood-and-numerical-implementation).
+New standalone and Stage 1–2 fits currently require **CPU** and
+**`fit_multiplicity="marginal"`**. Requests for CUDA or profile fitting fail
+explicitly; there is no silent CPU fallback or substitution of the legacy
+tree-based estimator. CPU execution requires neither CUDA nor PyTorch.
+Complete historical accepted fits retain their original algorithm, fitting
+objective and execution provenance during numerical replay; this does not
+authorize a new CUDA/profile fit. Stage 3's separate **profile assignment**
+remains supported. See the
+[numerical contract](docs/workflow_protocol_2_5.md#joint-likelihood-and-numerical-implementation).
 
 `FitConfig.max_multiplicity_difference` defaults to `1`; use `None` in Python, `null` in JSON,
 or `--max-multiplicity-difference none` for the independent regional model.
@@ -167,9 +163,13 @@ in workflow catalogs. Explicit exclusions and observed zero-depth pairs stay
 unchanged. To keep missing pairs uninformative, use `--missing-counts unobserved`
 for a fit or `"missing_counts": "unobserved"` in the workflow config.
 
-Standalone fitting publishes mutation clusters, cluster centers, and regional
-multiplicity calls. Fitting uses the original CN denominator even when
-multiplicity support is restricted. Stage 3 restores that original support for every fitted mutation. An explicit
+Standalone fitting publishes the same three tables: mutation clusters, cluster
+centers, and regional multiplicity calls. Output schema **17** retains every
+positive mixture component in the centers table, including `cluster_size=0`
+for components without MAP members. Component count and occupied MAP-group
+count are distinct; BIC uses the former. Fitting uses the original CN denominator
+even when multiplicity support is restricted. Stage 3 restores that original
+support for every fitted mutation. An explicit
 `--max-major-cn` selects a separately identified restricted population; the
 default retains all valid integer CN. Input audits report missing CN/purity and
 mapping problems without filling absent CN/purity, and report read imputations

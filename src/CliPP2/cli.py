@@ -12,11 +12,13 @@ from ._version import __version__
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2", allow_abbrev=False,
-        description="Fit joint regional CCFs with tree-seeded recurring partition search.",
+        description="Fit joint regional CCFs with tree-free marginal-mixture search (new fits: CPU/marginal only).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit = subparsers.add_parser("fit", allow_abbrev=False,
+                               help="Fit mixture centers and weights directly from observations; CPU/marginal only.",
+                               description="Tree-free joint marginal-mixture fitting; CUDA/profile requests fail explicitly.",
                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     inputs = fit.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--input-file", help="Canonical tumor TSV (optionally gzip-compressed).")
@@ -28,9 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Explicitly assume diploid normal CN only where it was not supplied.")
     fit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS,
                      help="Missing pairs use ALT=0 and REF=regional median observed total depth; unobserved opts out.")
-    fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
+    fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE,
+                     help="New mixture fits require cpu; cuda is unsupported and never falls back.")
     fit.add_argument("--fit-multiplicity", choices=("marginal", "profile"), default="marginal",
-                     help="Center fitting objective; selection always uses marginal-mixture BIC at frozen centers.")
+                     help="New fits require marginal: jointly optimize centers and weights. Profile fitting is unsupported; Stage 3 profile assignment is separate.")
     fit.add_argument("--max-multiplicity-difference", choices=("1", "none"), default="1",
                      help="Maximum regional multiplicity difference; none uses independent regional supports.")
     fit.add_argument(
@@ -38,13 +41,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit restricted-population CN ceiling; default retains all valid integer CN.",
     )
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
-                     help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
+                     help="Maximum positive mixture components, including components without MAP members (positive integer).")
     fit.add_argument("--cpu-threads", type=int, default=None,
                      help="CPU threads; fallback CLIPP2_CPU_THREADS, OMP_NUM_THREADS, then affinity/quota.")
     fit.add_argument("--run-manifest-id", help="External execution record identifier; no source scan is performed.")
     fit.add_argument("--version", action="version", version=__version__)
     workflow = subparsers.add_parser("workflow", allow_abbrev=False,
-                                    help="Run Protocol 2.5 from an explicit v7 JSON plan.")
+                                    help="Run Protocol 2.5 from a v7 plan; new fits require CPU/marginal, historical accepted fits may be replayed.")
     workflow.add_argument("--plan", required=True)
     workflow.add_argument("--output-dir", required=True)
     assign = subparsers.add_parser("assign", allow_abbrev=False,
@@ -64,13 +67,15 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN)
     audit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS)
     experiment = subparsers.add_parser("experiment-mixture", allow_abbrev=False,
-        help="CPU-only research: jointly fit mixture centers/weights from a saved marginal fit.")
+        help="CPU saved-population mixture comparison; output is not an accepted production fit.")
     experiment.add_argument("--catalog", required=True, help="Saved original_catalog.json.")
-    experiment.add_argument("--accepted-fit", required=True, help="Saved Stage 1 or Stage 2 accepted fit.")
+    experiment.add_argument("--accepted-fit", required=True,
+                            help="Validated saved marginal Stage 1/2 fit supplying the population, support and initializer.")
     experiment.add_argument("--output", required=True, help="New experimental JSON; not a workflow fit.")
     experiment.add_argument("--max-clusters", type=int, default=None,
                             help="Mixture component cap; defaults to the saved fit's search cap.")
-    experiment.add_argument("--proposal-budget", type=int, default=32)
+    experiment.add_argument("--proposal-budget", type=int, default=32,
+                            help="Bounded proposal slots; no global-optimality certificate.")
     experiment.add_argument("--cpu-threads", type=int, default=1)
     return parser
 

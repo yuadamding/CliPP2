@@ -90,11 +90,15 @@ class AcceptedFit(ImmutableArrayRecord):
     max_multiplicity_difference: int | None = field(default=1, kw_only=True)
 
     def __post_init__(self):
-        from .config import fitting_identity
+        from .config import fitting_identity, mixture_fitting_identity
+        from .kernel import ALGORITHM
+        soft = isinstance(self.producer_receipt, Mapping) and self.producer_receipt.get("algorithm") == ALGORITHM
         identity = (fitting_identity(max_multiplicity_difference=self.max_multiplicity_difference)
                     if self.method_identity is None else dict(self.method_identity))
-        if identity not in tuple(fitting_identity(method, max_multiplicity_difference=self.max_multiplicity_difference)
-                                 for method in ("marginal", "profile")):
+        allowed = ((mixture_fitting_identity(max_multiplicity_difference=self.max_multiplicity_difference),) if soft else
+                   tuple(fitting_identity(method, max_multiplicity_difference=self.max_multiplicity_difference)
+                         for method in ("marginal", "profile")))
+        if identity not in allowed:
             raise ValueError("Accepted fit requires a supported complete method identity")
         object.__setattr__(self, "method_identity", _freeze(identity))
         if self.fitting_log_likelihood is None:
@@ -114,15 +118,16 @@ class AcceptedFit(ImmutableArrayRecord):
         if (not n or not r or len(set(self.mutation_ids)) != n or len(set(self.region_ids)) != r
                 or labels.shape != (n,) or labels.dtype.kind not in "iu"
                 or centers.ndim != 2 or centers.shape[1] != r or not len(centers)
-                or not np.array_equal(np.unique(labels), np.arange(len(centers)))
+                or np.any(labels < 0) or np.any(labels >= len(centers))
+                or (not soft and not np.array_equal(np.unique(labels), np.arange(len(centers))))
                 or not np.isfinite(centers).all() or np.any(centers < 0) or np.any(centers > 1)):
-            raise ValueError("Accepted fit requires occupied source labels and finite native centers")
+            raise ValueError("Accepted fit requires valid source labels and finite native centers; legacy fits require occupied labels")
         for name in ("labels", "centers", "weights", "multiplicities"):
             object.__setattr__(self, name, readonly_array(getattr(self, name), dtype=np.int64 if name == "labels" else float))
         if self.multiplicities.shape != (n, r) or self.weights.shape != (len(centers),):
             raise ValueError("Accepted native parameters do not align with populations")
         if not np.isfinite(self.weights).all() or np.any(self.weights <= 0) or not np.isclose(self.weights.sum(), 1, atol=1e-12, rtol=0):
-            raise ValueError("Accepted fit requires positive normalized occupied-component weights")
+            raise ValueError("Accepted fit requires positive normalized component weights")
         if tuple(self.support.mutation_ids) != self.mutation_ids or tuple(self.support.region_ids) != self.region_ids:
             raise ValueError("Accepted support must be keyed to its exact fitted population")
         normalization = identity["multiplicity_normalization_id"]
@@ -222,9 +227,14 @@ class AcceptedFit(ImmutableArrayRecord):
         if producer.get("run_manifest_id") != producer["run_manifest"]["run_manifest_id"]:
             raise ValueError("Original producer run manifest link differs from its input binding")
         build = producer["run_manifest"].get("build")
-        from .config import fitting_identity
-        identity = fitting_identity(original_config.fit_multiplicity, original_config.selection_criterion,
-                                    original_config.max_multiplicity_difference)
+        from .config import fitting_identity, mixture_fitting_identity
+        soft = producer["algorithm"] == ALGORITHM
+        if soft != (producer["execution"].get("algorithm") == ALGORITHM):
+            raise ValueError("Producer algorithm and original optimizer execution differ")
+        identity = (mixture_fitting_identity(original_config.selection_criterion,
+                    original_config.max_multiplicity_difference) if soft else
+                    fitting_identity(original_config.fit_multiplicity, original_config.selection_criterion,
+                                     original_config.max_multiplicity_difference))
         if self.method_identity != identity:
             raise ValueError("Accepted fitting identity differs from its original configuration")
         if (producer.get("method_identity") != identity
@@ -233,7 +243,7 @@ class AcceptedFit(ImmutableArrayRecord):
         if "normal_cn_policy" not in producer or producer["normal_cn_policy"] not in (None, "diploid"):
             raise ValueError("Original fit lacks its explicit normal-CN assumption")
         if len(self.centers) > original_config.max_clusters:
-            raise ValueError("Accepted occupied count exceeds the original search capacity")
+            raise ValueError("Accepted component count exceeds the original search capacity")
         if build is not None:
             artifact = build["artifact"]
             if (artifact["protocol_version"] != producer["protocol_version"]
@@ -271,12 +281,28 @@ class AcceptedFit(ImmutableArrayRecord):
             if (model.mutation_ids != self.mutation_ids or model.identity != self.model_identity
                     or model.model_version != producer["model_version"]):
                 raise ValueError("Saved model identity or canonical population order differs")
-            fit = FitResult(Membership(explicit_labels=self.labels), self.centers, self.weights,
-                self.conditional_log_likelihood, self.mixture_log_likelihood, self.complexity_penalty,
-                self.score, True, fitting_log_likelihood=self.fitting_log_likelihood,
-                fit_objective_id=self.method_identity["fit_objective_id"],
-                selection_criterion_id=self.method_identity["selection_criterion_id"])
-            _verify_fitted_numerics(model, fit)
+            if soft:
+                from .kernel.mixture import MixtureFit
+                from .kernel.mixture_verification import verify_marginal_mixture
+                from .io.reporting import independent_log_columns
+                from scipy.special import logsumexp
+                columns = independent_log_columns(model, self.centers)
+                mass = columns + np.log(self.weights)
+                posterior = np.exp(mass - logsumexp(mass, axis=1)[:, None])
+                fit = MixtureFit(self.centers, self.weights, posterior, self.labels,
+                    self.mixture_log_likelihood, self.score, len(self.centers),
+                    len(np.unique(self.labels)), True, 0, {})
+                verified = verify_marginal_mixture(model, fit)
+                for key in ("fitting_log_likelihood", "conditional_log_likelihood", "complexity_penalty"):
+                    if not np.isclose(verified[key], getattr(self, key), atol=1e-7, rtol=1e-10):
+                        raise ValueError(f"Saved soft-mixture {key} differs from independent replay")
+            else:
+                fit = FitResult(Membership(explicit_labels=self.labels), self.centers, self.weights,
+                    self.conditional_log_likelihood, self.mixture_log_likelihood, self.complexity_penalty,
+                    self.score, True, fitting_log_likelihood=self.fitting_log_likelihood,
+                    fit_objective_id=self.method_identity["fit_objective_id"],
+                    selection_criterion_id=self.method_identity["selection_criterion_id"])
+                _verify_fitted_numerics(model, fit)
             calls = model.multiplicity(self.phi)
             if not np.array_equal(calls, self.multiplicities, equal_nan=True):
                 raise ValueError("Saved accepted multiplicities disagree with their native support/CCFs")
@@ -467,9 +493,12 @@ def classify_groups(catalog, fit, config):
 
 def select_reference_source(groups):
     """Nearest occupied native center; depth breaks only an exact distance tie."""
-    if not groups or any(group["size"] < 1 or not np.isfinite(group["distance_to_one"]) for group in groups):
+    if not groups or any(group["size"] < 0 or not np.isfinite(group["distance_to_one"]) for group in groups):
         raise ValueError("Reference source selection requires occupied groups with finite native centers")
-    selected = min(groups, key=lambda g: (g["distance_to_one"], -g["minimum_regional_depth"], g["source_label"]))
+    occupied = [group for group in groups if group["size"] > 0]
+    if not occupied:
+        raise ValueError("Reference source selection requires at least one occupied MAP group")
+    selected = min(occupied, key=lambda g: (g["distance_to_one"], -g["minimum_regional_depth"], g["source_label"]))
     return dict(selected, reference_source_role="provisional_reference_source", selection_rule="nearest_to_one")
 
 
@@ -626,6 +655,9 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         raise TypeError("workflow_config must be a WorkflowConfig")
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
+    if accepted_stage_one is None:
+        from .production import require_supported_production
+        require_supported_production(workflow_config.fit)
     config, output = workflow_config, reserve_output(outdir)
     common_receipt = dict(schema="clipp2.workflow.v7", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, config=asdict(config),
@@ -709,7 +741,9 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         stage_one_candidate_count=len(population), stage_two_candidate_count=0,
         original_mutation_count=len(catalog.mutation_ids),
         stage_one="pending", stage_two="not_applicable", stage_three="not_applicable",
-        counts=dict(N1=0, N0=0, N2=0, Q2=0, merged_groups=0, combined_mutations=0, K=0))
+        counts=dict(N1=0, N0=0, N2=0, Q2=0, Q1=0,
+                    stage_one_occupied_map_groups=0, stage_two_occupied_map_groups=0,
+                    merged_groups=0, combined_mutations=0, K=0))
     current_stage = "stage_one"
     receipt["current_phase"] = "stage_one_fit"
     def unavailable_original(first):
@@ -740,6 +774,8 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         if set(stage_one.mutation_ids) != set(population):
             raise AssertionError("Accepted Stage 1 population differs from the numerical candidate population")
         receipt["counts"]["N1"] = len(stage_one.mutation_ids)
+        receipt["counts"].update(Q1=len(stage_one.centers),
+            stage_one_occupied_map_groups=len(np.unique(stage_one.labels)))
         receipt["stage_one"] = "accepted"
         receipt["current_phase"] = "stage_one_record_publication"
         save_accepted_fit(stage_one, output / "stage_one_accepted.json")
@@ -791,7 +827,8 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
                 stage_two = replay(accepted_stage_two, remainder, caps.subset(remainder), stage_two_config)
             if set(stage_two.mutation_ids) != set(remainder):
                 raise AssertionError("Accepted Stage 2 population differs from its numerical candidate population")
-            receipt["counts"].update(N2=len(stage_two.mutation_ids), Q2=len(stage_two.centers))
+            receipt["counts"].update(N2=len(stage_two.mutation_ids), Q2=len(stage_two.centers),
+                stage_two_occupied_map_groups=len(np.unique(stage_two.labels)))
             receipt["stage_two"] = "accepted"
             receipt["current_phase"] = "stage_two_record_publication"
             save_accepted_fit(stage_two, output / "stage_two_accepted.json")

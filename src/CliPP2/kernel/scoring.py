@@ -108,6 +108,15 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
         weights = np.ones(k)/k
 
     tolerance = 1e-8
+    warm_score = -gradient(weights)
+    warm_gap = max(0., float(warm_score.max()-1.))
+    warm_active_gap = float(warm_score.max()-warm_score[weights > 0].min())
+    if warm_gap <= tolerance and warm_active_gap <= tolerance:
+        record("weight_warm_start_hits")
+        return {"cluster_weights": weights,
+                "log_likelihood": float(np.sum(offset+log_mass(weights))),
+                "weight_optimality_gap": n*warm_gap,
+                "weight_active_score_gap": warm_active_gap}
     record("weight_slsqp_calls")
     fit = minimize(
         objective,

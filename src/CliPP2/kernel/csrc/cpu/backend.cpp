@@ -42,6 +42,8 @@ struct Context {
     CliPP2BackendDiagnostics diagnostics{};
     clipp2::ProbabilityWork probability_work{};
     clipp2::ProbabilityCache probability_cache;
+    std::vector<std::int64_t> mixture_offsets;
+    std::vector<double> mixture_normalizers, mixture_masses;
     int cpu_threads = 0;
 
     explicit Context(const clipp2::ObservationSoA& input) {
@@ -58,6 +60,20 @@ struct Context {
         joint_workspace.prepare(view);
         diagnostics.prepared_bytes = cells * 65 + 8*(joint_workspace.offsets.size()+joint_workspace.rows.size());
         diagnostics.workspace_bytes = 8*joint_workspace.values.capacity();
+    }
+
+    void prepare_mixture() {
+        if(!mixture_offsets.empty())return;
+        const auto cells=product(view.mutations,view.regions);
+        std::vector<std::int64_t> offsets(clipp2::JointWorkspace::add(cells,1),0);
+        for(std::int64_t cell=0;cell<cells;++cell)
+            offsets[cell+1]=clipp2::JointWorkspace::add(offsets[cell],view.support[cell]);
+        std::vector<double> normalizers(view.mutations);
+        std::vector<double> masses(clipp2::JointWorkspace::size(offsets.back()));
+        for(std::int64_t row=0;row<view.mutations;++row)
+            normalizers[row]=clipp2::joint_log_normalizer(clipp2::JointMass{view,row,nullptr,1});
+        mixture_offsets.swap(offsets);mixture_normalizers.swap(normalizers);mixture_masses.swap(masses);
+        diagnostics.prepared_bytes+=8*(mixture_offsets.size()+mixture_normalizers.size());
     }
 };
 Context& context(void* value) {
@@ -132,7 +148,8 @@ extern "C" int CliPP2BackendGetDiagnostics(void* value, CliPP2BackendDiagnostics
     return guarded([&] {
         require(output, "Null diagnostics output"); auto& ctx = context(value);
         ctx.diagnostics.cache_bytes = ctx.probability_cache.bytes();
-        ctx.diagnostics.workspace_bytes=std::max<std::int64_t>(ctx.diagnostics.workspace_bytes,8*ctx.joint_workspace.values.capacity());
+        ctx.diagnostics.workspace_bytes=std::max<std::int64_t>(ctx.diagnostics.workspace_bytes,
+            8*(ctx.joint_workspace.values.capacity()+ctx.mixture_masses.capacity()));
         *output = ctx.diagnostics;
     });
 }
@@ -411,6 +428,64 @@ extern "C" int CliPP2JointDiagnostics(void* value,const double* phi,const double
                 accepted_logp,map_logp,conditional,probabilities,ctx.joint_workspace.messages(row),accepted));
         }
         ++ctx.diagnostics.calls;
+    });
+}
+
+extern "C" int CliPP2MixtureEStep(void* value,std::int64_t count,const double* centers,
+        double* log_marginal,double* probabilities,std::uint8_t* status) {
+    return guarded([&] {
+        auto& ctx=context(value);const auto n=ctx.view.mutations,R=ctx.view.regions;
+        const auto rows=product(count,n);product(count,R);
+        require(ctx.view.aggregation==clipp2::LikelihoodAggregation::UniformMarginal,
+            "Mixture E-step requires marginal aggregation");
+        require(!rows||(centers&&log_marginal&&probabilities&&status),"Missing mixture E-step buffers");
+        if(!rows)return;
+        ctx.prepare_mixture();const auto packed=ctx.mixture_offsets.back();product(count,packed);
+        // Batches share one raw-mass workspace. Rows within each batch are
+        // disjoint, including their existing forward/backward scratch arena.
+        for(std::int64_t k=0;k<count;++k) {
+            double* posterior=probabilities+k*packed;
+            CLIPP_PARALLEL_FOR
+            for(std::int64_t row=0;row<n;++row) {
+                const auto index=k*n+row;const double* phi=centers+k*R;
+                auto state=clipp2::EmitStatus::Ok;
+                for(std::int64_t r=0;r<R;++r) {
+                    const auto cell=r*n+row;
+                    if(!clipp2::finite_number(phi[r])||phi[r]<0||phi[r]>1)
+                        state=clipp2::EmitStatus::InvalidInput;
+                    else if(state==clipp2::EmitStatus::Ok&&(phi[r]<ctx.view.lower[cell]||phi[r]>ctx.view.upper[cell]))
+                        state=clipp2::EmitStatus::ZeroLikelihood;
+                    for(auto j=ctx.mixture_offsets[cell];j<ctx.mixture_offsets[cell+1];++j)
+                        posterior[j]=clipp2::quiet_nan;
+                }
+                log_marginal[index]=-clipp2::positive_infinity;
+                if(state!=clipp2::EmitStatus::Ok){status[index]=static_cast<std::uint8_t>(state);continue;}
+                clipp2::JointMass mass{ctx.view,row,phi,1,ctx.mixture_offsets.data(),ctx.mixture_masses.data()};
+                for(std::int64_t r=0;r<R;++r)if(mass.active(r)) {
+                    const auto cell=r*n+row;const auto observation=clipp2::observation(ctx.view,cell);
+                    for(auto m=mass.lo(r);m<=mass.hi(r);++m)
+                        ctx.mixture_masses[ctx.mixture_offsets[cell]+m-mass.lo(r)]=
+                            clipp2::raw_component_log_mass(observation,phi[r],m);
+                }
+                const double raw=clipp2::joint_cavities(mass,ctx.mixture_offsets.data()+row,
+                    posterior,ctx.joint_workspace.messages(row),false,n);
+                const double normalizer=ctx.mixture_normalizers[row];
+                log_marginal[index]=raw-normalizer;
+                for(std::int64_t r=0;r<R;++r) {
+                    const auto cell=r*n+row;
+                    for(auto m=mass.lo(r);m<=mass.hi(r);++m) {
+                        const auto j=ctx.mixture_offsets[cell]+m-mass.lo(r);
+                        posterior[j]=mass.active(r)&&clipp2::finite_number(raw)?
+                            ::exp(posterior[j]+mass(r,m)-raw):clipp2::quiet_nan;
+                    }
+                }
+                state=raw==-clipp2::positive_infinity?clipp2::EmitStatus::ZeroLikelihood:
+                    clipp2::finite_number(raw)&&clipp2::finite_number(normalizer)?clipp2::EmitStatus::Ok:
+                    clipp2::EmitStatus::NumericalFailure;
+                status[index]=static_cast<std::uint8_t>(state);
+            }
+        }
+        ++ctx.diagnostics.calls;record_evaluations(ctx,product(rows,R));
     });
 }
 extern "C" int CliPP2PooledJointPilots(void* value,const std::int64_t* grid_offsets,const double* grids,

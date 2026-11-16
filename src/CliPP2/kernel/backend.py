@@ -242,6 +242,16 @@ class NativeBackend:
                    _array(model.observed.T, np.uint8)]
         self._support = np.array(support, dtype=np.int64, copy=True)
         self._minimum = np.array(minimum, dtype=np.int64, copy=True)
+        offsets = _array(np.r_[0, np.cumsum(self._support.T.ravel())], np.int64)
+        if np.any(offsets[1:] <= offsets[:-1]):
+            raise ValueError("Packed multiplicity offsets overflow or have empty support")
+        # Bytes-backed storage cannot be made writable by a caller. The native
+        # context owns the matching immutable support throughout its lifetime.
+        self._component_offsets = np.frombuffer(offsets.tobytes(), dtype=np.int64)
+        self._mixture_e_step = getattr(lib, "CliPP2MixtureEStep", None) if kind == "cpu" else None
+        if self._mixture_e_step is not None:
+            self._mixture_e_step.argtypes = [ct.c_void_p, ct.c_int64, _D, _D, _D, _B]
+            self._mixture_e_step.restype = ct.c_int
         observations = _Observations(model.n, model.r, *map(_ptr, fields), int(aggregation == "profile"),
                                     -1 if self.max_multiplicity_difference is None else self.max_multiplicity_difference)
         self.context = ct.c_void_p()
@@ -678,8 +688,7 @@ class NativeBackend:
         calls = None if accepted_calls is None else _array(np.asarray(accepted_calls).T)
         if calls is not None and calls.shape != states.shape:
             raise ValueError("Accepted calls must match N by R")
-        widths = self._support.T.ravel()
-        offsets = _array(np.r_[0, np.cumsum(widths)], np.int64)
+        offsets = self._component_offsets
         rows = np.empty((self.n, 4))
         fields = [np.empty_like(states) for _ in range(4)]
         conditional, probabilities = np.empty(offsets[-1]), np.empty(offsets[-1])
@@ -700,6 +709,37 @@ class NativeBackend:
                            (result["conditional_max"][i][r] == result["profile"][i])))
             for r in range(self.r)) for i in range(self.n))
         return result
+
+    def mixture_e_step(self, centers):
+        """Batched CPU marginal emissions and packed multiplicity posteriors.
+
+        ``log_marginal`` and ``status`` have shape N by K; ``probabilities``
+        has shape K by P. The immutable ``offsets`` index region-major cells
+        ``r*N+i``; each cell contains ascending multiplicities on fixed support.
+        Inactive pairs and zero-emission rows have undefined (NaN) posteriors.
+        Assignment bounds apply, as for ``joint_columns``. No reporting/MAP
+        diagnostics or endpoint log derivatives are evaluated by this API.
+        """
+        self._require_open()
+        if self.kind != "cpu":
+            raise NativeExecutionError("The packed mixture E-step requires the CPU backend; CUDA is not implemented")
+        if self.aggregation != "marginal":
+            raise ValueError("The mixture E-step requires marginal aggregation")
+        if self._mixture_e_step is None:
+            raise NativeExecutionError("The native CPU library lacks the packed mixture E-step; rebuild CliPP2")
+        centers = _array(centers)
+        if centers.ndim == 1:
+            centers = centers[None, :]
+        if (centers.ndim != 2 or centers.shape[1] != self.r
+                or not np.isfinite(centers).all() or np.any((centers < 0) | (centers > 1))):
+            raise ValueError("Mixture centers must be finite K by R CCFs in [0, 1]")
+        rows = np.empty((len(centers), self.n))
+        probabilities = np.empty((len(centers), int(self._component_offsets[-1])))
+        status = np.empty(rows.shape, np.uint8)
+        self._check(self._mixture_e_step(self.context, len(centers), _ptr(centers),
+            _ptr(rows), _ptr(probabilities), _ptr(status)), status)
+        return {"log_marginal": rows.T, "probabilities": probabilities,
+                "offsets": self._component_offsets, "status": status.T}
 
     def pooled_joint_pilots(self, grids, weights):
         """Integrate sparse regional CCF pools and condition on joint multiplicities."""

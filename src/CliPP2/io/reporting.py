@@ -10,13 +10,14 @@ import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
-from ..kernel import ALGORITHM, SCORE_DEFINITION
+from ..kernel import ALGORITHM, LEGACY_SEARCH_ALGORITHMS, SCORE_DEFINITION
 from ..kernel.topology import partition_from_cuts
 from ..tree.candidates import validate_candidate_bank
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-OUTPUT_SCHEMA_VERSION = 16
+OUTPUT_SCHEMA_VERSION = 17
+LEGACY_OUTPUT_SCHEMA_VERSION = 16
 MANIFEST_SCHEMA = 'clipp2.file-list.v1'
 VERIFICATION_SCHEMA_VERSION = 6
 
@@ -207,6 +208,23 @@ def verify_selected(model, result):
     replace the joint mixture score. This does not certify a local or global
     optimum over memberships.
     """
+    if getattr(result, "algorithm", None) == ALGORITHM:
+        from ..kernel.mixture_verification import verify_marginal_mixture
+        if (result.selected.fit.mixture is not result.search.best
+                or not 0 <= result.selected.state_index < len(result.search.candidates)
+                or result.search.candidates[result.selected.state_index] is not result.search.best):
+            raise ValueError("Published mixture differs from the retained selected search state")
+        verified = verify_marginal_mixture(model, result.search.best,
+                                          candidates=result.search.candidates)
+        fit = result.selected.fit
+        for key in ("fitting_log_likelihood", "conditional_log_likelihood", "complexity_penalty", "score"):
+            if not np.isclose(verified[key], getattr(fit, key), atol=1e-7, rtol=1e-10):
+                raise ValueError(f"Independent soft-mixture verification disagrees on {key}")
+        return dict(verified, **dict(fit.method_identity), verification_schema_version=VERIFICATION_SCHEMA_VERSION,
+                    independently_verified=True, method_identity=dict(fit.method_identity),
+                    membership_kind="soft_mixture", complete_candidate_bank_reconciled=True,
+                    selected_fitted_state_retained=True, local_optimality_certified=False,
+                    global_optimality_proven=False, hard_refits=0)
     selected = result.selected
     fit, labels = selected.fit, selected.fit.labels
     q = len(fit.centers)
@@ -244,7 +262,7 @@ def result_tables(model, result, tumor_id):
     phi = centers[labels]
     wide = pd.DataFrame(dict(tumor_id=tumor_id, mutation_id=model.mutation_ids, cluster_label=public))
     cluster = pd.DataFrame(dict(tumor_id=tumor_id, cluster_label=np.arange(len(order)),
-                                cluster_size=np.bincount(public)))
+                                cluster_size=np.bincount(public, minlength=len(order))))
     calls = model.multiplicity(phi)
     calls = np.where(~model.observed & (model.support == 1), model.multiplicity_min, calls)
     calls = np.where(phi == 0, np.nan, calls)
@@ -300,8 +318,9 @@ def publish(model, result, outdir, tumor_id, *, progress=None):
     output_seconds = perf_counter()-started
     if progress is not None:
         progress.emit(complete=True)
-    return {'status': 'complete', 'algorithm': ALGORITHM,
-            'output_schema_version': OUTPUT_SCHEMA_VERSION,
+    return {'status': 'complete', 'algorithm': getattr(result, 'algorithm', LEGACY_SEARCH_ALGORITHMS[0]),
+            'output_schema_version': (OUTPUT_SCHEMA_VERSION if getattr(result, 'algorithm', None) == ALGORITHM
+                                      else LEGACY_OUTPUT_SCHEMA_VERSION),
             'manifest_schema': MANIFEST_SCHEMA, 'files': files,
             'verification_seconds': verification_seconds, 'output_seconds': output_seconds,
             'verification': verification}

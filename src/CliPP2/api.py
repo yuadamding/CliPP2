@@ -1,4 +1,4 @@
-"""One free-center, joint-region workflow backed by CliPP2's own kernel."""
+"""Tree-free observed marginal-mixture fitting from prepared observations."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -23,6 +23,8 @@ def process_tumor(tumor_file: str | Path, outdir: str | Path,
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
+    from .production import require_supported_production
+    require_supported_production(config)
     started = perf_counter()
     progress = None if progress_callback is None else ProgressReporter(None, progress_callback)
     if progress is not None:

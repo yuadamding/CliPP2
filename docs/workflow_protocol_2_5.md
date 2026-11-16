@@ -2,7 +2,7 @@
 
 Protocol 2.5 restricts each mutation's regional multiplicity range to at most
 one throughout inference. The restriction is established before pilot CCFs and
-tree construction, applies to every fitted candidate, and is retained during
+mixture initialization, applies to every fitted candidate, and is retained during
 fixed-reference Stage 3 assignment. Different mutations in a CCF cluster may
 have different multiplicities.
 
@@ -102,95 +102,101 @@ vector is counted exactly once. Structural support is nonempty exactly when
 $\max_r L_r\le\min_r U_r+1$ for nonempty $J_i$.
 
 Regional pooled CCF distributions are retained. Component-wise integration over
-those pools is combined through the joint DP to obtain posterior CCF means before
-`build_tree`. A structurally feasible row with zero pooled joint evidence uses
+those pools is combined through the joint DP to obtain posterior CCF means.
+A structurally feasible row with zero pooled joint evidence uses
 the labeled interior start `(pooled_CCF+0.5)/2`, preserving NA on unobserved
 coordinates; that fallback is not reported as a posterior mean.
 
-Continuation uses one joint loss per mutation and regional gradients/positive
-working curvatures. Endpoint derivatives retain contributions from zero-mass
-components through cavity likelihoods. Line searches evaluate the actual joint
-objective; a diagonal working scale is not an exact Hessian.
+New production fits start directly from these observations: one mean pilot
+vector and, when available within the component cap, two far-separated pilot
+vectors. Missing pilot coordinates are filled for initialization only; the
+observation mask and multiplicity support are unchanged. No proposal tree,
+tree-search winner, or accepted fit is required.
 
-Group refits operate on full regional center vectors. Marginal fitting uses
-joint posterior EM, interior boundary rescue and feasible stationarity checks.
-The accepted stationarity residual is the largest feasible gradient or
-directional-slope magnitude divided by one plus the group mutation count, with
-tolerance `1e-5` (the inner iteration targets `1e-7`).
-Profile fitting uses conditional coordinate envelopes with offsets from the
-other regions. Each conditional coordinate search can be global, but the full
-multiregion fit is local. Whole-group caches reuse unchanged memberships and
-full starting vectors; independent scalar caches are used only with `None`.
+Centers and weights jointly optimize the observed marginal-mixture likelihood.
+Soft cluster responsibilities multiply conditional joint-multiplicity
+posteriors in the weighted binomial center M-step. The fitting-specific native
+E-step returns emissions and packed posterior probabilities without publication
+MAP/tie diagnostics. Fixed support normalizers and packed read/slope terms are
+reused. Identical slopes are aggregated exactly in the concave coordinate solve;
+this does not truncate multiplicity support or merge nearby centers.
 
-Set `fit_multiplicity="profile"` in the workflow plan, or pass
-`--fit-multiplicity profile` to `clipp2 fit`, to select profile center fitting.
-Stage 3 retains its separately configured assignment method.
+Intermediate iterations use EM weight updates, with periodic and final full
+weight optimization. Warm-start weights already passing the KKT gate need no
+new optimizer run. Endpoint derivatives retain finite probability derivatives
+from zero-emission rows through cavity likelihoods. Actual-likelihood rescue
+uses objective and gradients normalized by `1+n`; center qualification requires
+the feasible projected-gradient residual at most `1e-5`. Final weights must pass
+their original stationarity gates. Iteration exhaustion is not convergence.
+Monotonicity is checked within each trajectory, not against a different start's
+initial likelihood. MAP labels are reported only after fitting and never cause
+a hard-partition center refit.
 
+New `fit` and Stage 1–2 execution support **CPU/marginal only**. CUDA and profile
+fit requests fail explicitly, without CPU fallback or legacy-estimator
+substitution. Historical accepted fits retain their original replay semantics;
+Stage 3 still supports its separately configured marginal or profile assignment.
 With `max_multiplicity_difference=None`, emissions and pooled pilots factor by
-region, marginal scores subtract each regional interval-width normalizer, and
-center refits are scalar. Independent profile refits search adjacent-branch
-breakpoints and bounded derivative roots to find a scalar global maximum.
-That guarantee does not extend to joint group refits. Profile scores use raw
+region and marginal scores subtract regional interval-width normalizers; the
+new production objective remains a soft mixture. Profile assignment uses raw
 binomial maxima, including binomial coefficients, without prior normalization.
 
 ## Model selection and Stage 3
 
-Stages 1 and 2 retain the previous tree/coarsening/reassignment winner as an
-initializer, then recur over general partitions: pilot-based births inside
-existing groups, individual transfers with positive or nonpositive old-center
-gain, all-pair merges, and atomic merge-two/split-third moves. Conditional refits
-and full-population mixture scoring are unchanged. A diverse frontier keeps up
-to two states per cluster count; all eligible evaluated states remain in the
-final BIC comparison. The additional budget is `256 * max_clusters` proposal
-slots, shared across the five round-robin operators. Distinct initial centers
-remain distinct refit requests. Nonimproving intermediate states can advance
-through the frontier, but this is not an exhaustive search.
+Stages 1 and 2 explore pilot-based births, transfer-derived starts, all-pair
+merges and atomic merge-two/split-third starts. Proposals are constructed lazily
+and consumed round-robin, with a recurring candidate frontier. Production uses
+32 proposal slots beyond its observation-derived seeds. This is a bounded
+heuristic search, not exhaustive exploration or a global component-selection
+algorithm; an unvisited or unconverged start has not been ruled out.
 
-Termination distinguishes budget exhaustion from exhaustion of implemented
-proposals on the retained frontier, not all possible partitions. Neither is a
-local-optimum certificate; no exhaustive single-mutation audit is performed.
-Selected-fit numerical verification and candidate-bank reconciliation remain
-mandatory. Stage 3 independently verifies its fixed-reference assignments.
+Each proposal tries its supplied centers and an interior blend, skipping exact
+duplicate starts. Every distinct converged result is retained for the outer
+BIC comparison, including starts with different effective component counts.
+Selecting only the highest likelihood across those counts is not valid.
+Exactly identical center vectors are consolidated by summing weights, and
+component order is canonicalized before scoring and search deduplication.
+Nearby but unequal centers are not silently consolidated. Exact-zero slots are
+removed from final states; a distinct positive-weight component is retained
+even if it has no MAP-assigned mutations.
 
-At fitted centers, mixture weights maximize the constrained marginal likelihood:
+For positive component count $K_+$, the fitted objective and selection score are
 
 $$
-\ell_{mix}=\max_{\boldsymbol\pi}\sum_i\log\sum_k\pi_k e^{A_i(\boldsymbol\phi_k)},
-\qquad \mathrm{BIC}=-2\ell_{mix}+(KR+K-1)\log n.
+\ell_{mix}(\Phi,\boldsymbol\pi)=\sum_i\log\sum_k\pi_k e^{A_i(\boldsymbol\phi_k)},
+\qquad \mathrm{BIC}=-2\ell_{mix}+(K_+R+K_+-1)\log n.
 $$
 
-The fixed difference limit adds no continuous parameter. Profile fitting retains
-marginal-mixture selection at its fitted centers. This remains a BIC-form hybrid
-criterion with data-derived supports and conditional center fitting, not a claim
-of joint mixture-center optimization or new BIC consistency.
+The fixed difference limit adds no continuous parameter. This is joint
+mixture-center optimization, but neither numerical stationarity nor bounded
+search proves a global maximum, global BIC minimum, biological accuracy, or
+BIC consistency with data-derived support. Selected-state independent checks
+reconstruct likelihood, normalized responsibilities, component count, BIC and
+weight KKT residuals once before publication. The complete retained bank is
+reconciled for count/score arithmetic and selected-state retention; it is not
+independently refitted. Hard-group occupancy and group-region coverage are not
+soft-mixture acceptance gates.
 
-### Separate experimental mixture estimator
+### Saved-population comparison and historical replay
 
 `experiment-mixture` uses an independently validated saved marginal fit only as
-an initializer and support/population specification. It optimizes
-$\sum_i\log\sum_k\pi_k e^{A_i(\boldsymbol\phi_k)}$ jointly in centers and weights,
-with soft cluster responsibilities and conditional joint-multiplicity
-posteriors. Weighted concave binomial coordinate M-steps, exact endpoint
-derivatives, an interior start and actual-likelihood refinement preserve
-nondecreasing likelihood and require a projected-gradient stopping check.
-The normalized center residual is bounded by `1e-5`; weights pass the existing
-weight optimizer's independent stationarity gates. Iteration exhaustion is a
-failed candidate, not convergence. This remains a local, CPU-only research fit.
+an initializer and support/population specification for the same CPU soft-mixture
+optimizer. Its selected result also receives independent soft-mixture checks.
+The command's experimental JSON is not an `AcceptedFit` and cannot silently
+enter Stage 3; production fitting does not depend on that saved initializer.
 
-Its separate bounded search proposes births, transfer-derived starts, merges
-and atomic split–merges. Positive-weight components without MAP-assigned
-mutations are retained; exact-zero weights are not replaced with arbitrary
-epsilon. BIC uses the positive component count, while MAP occupancy is reported
-separately. No hard-partition center refit follows MAP assignment. Experimental
-JSON is deliberately not an `AcceptedFit` and cannot silently enter Stage 3.
-The production workflow above remains the conditional-center estimator.
+Saved `regional_recurring_general_search_v8` and `regional_bounded_search_v7`
+fits retain their conditional-center objective and hard-group verification,
+including occupied-label requirements. Their original algorithm, producer
+receipt and state fingerprint remain unchanged, with a separate current
+compatibility check. New `regional_tree_free_marginal_mixture_v1` fits instead
+use soft-mixture verification and `observed_joint_marginal_mixture_v1` as their
+fitting-objective identity. Replay neither converts the estimator nor runs a
+new search; an old CUDA/profile receipt is not qualification for a new fit.
 
-Saved `regional_bounded_search_v7` fits remain numerically replayable because
-their model/refitter is unchanged. Their original algorithm, source receipt
-and state fingerprint are preserved, with a separate current compatibility
-check; replay does not relabel them as newly searched fits.
-
-Stage 1 selects a provisional source nearest all ones. Donor multiplicities use
+Stage 1 selects the occupied MAP group nearest all ones as its provisional
+source. A positive component without MAP members remains in the native fit but
+cannot supply donor reads. Donor multiplicities use
 the projections of the complete joint MAP set, taking each regional projection's
 upper endpoint and then the minimum across eligible donors in that region-segment.
 Mapping, observation and exclusion conditions remain in force, and CCF must be
@@ -209,6 +215,9 @@ merged sources are evaluated at all ones, with native diagnostics retained.
 `merged_groups` counts non-exact near-clonal Stage 2 groups; exact duplicates
 are counted separately. The reference-policy identity binds this rule, and
 existing frozen assignment bundles retain their original reference sets.
+Distinct positive Stage 2 components without MAP members also remain reference
+candidates; their read-support diagnostics are explicitly empty, not evidence
+for deleting their fitted mixture contribution.
 
 Stage 3 freezes this consolidated set and reassesses all fitted mutations; the
 merge does not lock their final assignments. Its scores are $A_i-\log K$ or
@@ -225,18 +234,28 @@ profile loss distinguish the cost of coupling from independent regional fit.
 
 ## Publication and replay
 
-Current identities bind the difference setting, support normalization, pilot
-policy, group-refit policy and both fitting/selection objectives. New receipts
+Current identities bind the difference setting, support normalization, seed
+policy, fitting algorithm and both fitting/selection objectives. New receipts
 require the setting explicitly; older receipts cannot inherit the new default.
 
 | Contract | Version |
 | --- | --- |
 | Protocol / package | 2.5 / 2.2.0 |
-| Fit output / numerical verification | v16 / v6 |
+| New mixture fit output / numerical verification | v17 / v6 |
 | Workflow plan / receipt | v7 |
 | Accepted fit / state / producer | v5 / v5 / v4 |
 | Assignment bundle / result | v7 / v10 |
 
-Publication independently reconstructs joint scores, normalization, multiplicity
-calls, ties, conditional probabilities, and BIC. Accepted-fit replay verifies
-the saved inputs, support, configuration, and numerical state without refitting.
+The same three public fit tables are retained. Schema 17 centers include all
+positive components, with `cluster_size=0` permitted for MAP-empty components;
+summaries distinguish positive components from occupied MAP groups. Public
+label 0 remains the largest final-center L2 norm, not an enforced clonal center.
+Historical hard-partition publication keeps schema 16 and its original semantics.
+
+Fit publication independently reconstructs the selected mixture's probabilities
+and BIC, while final native multiplicity reporting runs only for the selected
+state. Stage 3 separately verifies fixed-reference scores and assignments.
+Accepted-fit replay verifies saved inputs, support, configuration and numerical
+state under the explicitly recorded algorithm without refitting. The retained
+`conditional_log_likelihood` is descriptive for new soft fits;
+`fitting_log_likelihood` is their observed mixture likelihood.

@@ -38,6 +38,11 @@ int CliPP2JointDiagnostics(void*, const double* phi, const double* accepted,
     const std::int64_t* offsets, double* row_values, double* maps, double* component_at_map,
     double* accepted_logp, double* map_logp, double* conditional_max, double* probabilities,
     std::uint8_t* status);
+// Optional CPU fitting capability, not a change to the shared observation ABI.
+// Centers [cluster, region], logs/status [cluster, mutation], probabilities
+// [cluster, packed region-major support]. No MAP/tie/reporting calculations.
+int CliPP2MixtureEStep(void*, std::int64_t count, const double* centers,
+    double* log_marginal, double* probabilities, std::uint8_t* status);
 int CliPP2PooledJointPilots(void*, const std::int64_t* grid_offsets, const double* grids,
     const double* weights, double* pilots, std::uint8_t* status);
 int CliPP2RefitGroupsBatch(void*, std::int64_t groups, const std::int64_t* offsets,

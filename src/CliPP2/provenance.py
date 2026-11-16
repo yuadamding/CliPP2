@@ -29,7 +29,8 @@ def validate_fit_execution_receipt(config_record, execution, *, build=None):
     Optional external build evidence strengthens these checks; its absence never
     permits missing native execution evidence or defaulted saved settings.
     """
-    from .config import FitConfig, fitting_identity
+    from .config import FitConfig, fitting_identity, mixture_fitting_identity
+    from .kernel import ALGORITHM, LEGACY_SEARCH_ALGORITHMS
     if not isinstance(config_record, Mapping) or set(config_record) != set(FitConfig.__dataclass_fields__):
         raise ValueError("Original fit configuration must explicitly contain every FitConfig field")
     try:
@@ -44,12 +45,22 @@ def validate_fit_execution_receipt(config_record, execution, *, build=None):
                    for key in ("build_id", "numerical_policy"))):
         raise ValueError("Original execution lacks native kind, build identity, or numerical policy")
     kind = native["kind"]
-    routes = dict(device=kind, backend=f"native_{kind}_likelihood_host_forest",
-                  conditional_refit_backend=f"native_{kind}",
-                  weight_execution="cuda_resident" if kind == "cuda" else "cpu")
+    algorithm = execution.get("algorithm")
+    soft = algorithm == ALGORITHM
+    if algorithm is not None and algorithm not in (ALGORITHM, *LEGACY_SEARCH_ALGORITHMS):
+        raise ValueError("Original execution has an unsupported fitting algorithm")
+    routes = (dict(device="cpu", backend="native_cpu_marginal_mixture",
+                   conditional_refit_backend=None, center_execution="cpu_soft_joint_em",
+                   weight_execution="cpu", hard_refits=0) if soft else
+              dict(device=kind, backend=f"native_{kind}_likelihood_host_forest",
+                   conditional_refit_backend=f"native_{kind}",
+                   weight_execution="cuda_resident" if kind == "cuda" else "cpu"))
+    if soft and (kind != "cpu" or config.fit_multiplicity != "marginal" or execution["continuation"] is not None):
+        raise ValueError("Tree-free mixture execution requires CPU/marginal and no forest continuation")
     if config.device != kind or any(execution.get(key) != value for key, value in routes.items()):
         raise ValueError("Original execution routes disagree with its configured device")
-    expected = fitting_identity(config.fit_multiplicity, config.selection_criterion, config.max_multiplicity_difference)
+    expected = (mixture_fitting_identity(config.selection_criterion, config.max_multiplicity_difference) if soft else
+                fitting_identity(config.fit_multiplicity, config.selection_criterion, config.max_multiplicity_difference))
     selection = execution.get("selection_native")
     if (execution.get("method_identity") != expected or native.get("aggregation") != config.fit_multiplicity
             or native.get("max_multiplicity_difference", "missing") != config.max_multiplicity_difference
@@ -102,7 +113,7 @@ def validate_replay_policy(accepted, requested_fit_config, *, normal_cn_policy):
     # AcceptedFit.validate must still verify the exact requested population,
     # numerical inputs, masks and effective support before any reuse is allowed.
     if len(accepted.centers) > original.max_clusters:
-        raise ValueError("Accepted occupied count exceeds the original search capacity")
+        raise ValueError("Accepted component count exceeds the original search capacity")
     return original
 
 

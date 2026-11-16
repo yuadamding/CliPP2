@@ -7,10 +7,12 @@ import numpy as np
 
 from .proposals import refine_partition
 from ..config import DEFAULT_MAX_CLUSTERS
-from ..kernel import ALGORITHM
+from ..kernel import LEGACY_SEARCH_ALGORITHMS
 from .candidates import Candidate as Candidate, CandidateBank as _CandidateBank, score_key as _score_key
 from .policy import POLICY, SearchWork
 from ..kernel.topology import build_tree, canonical_partition, partition_from_cuts
+
+ALGORITHM = LEGACY_SEARCH_ALGORITHMS[0]
 
 
 @dataclass(eq=False)
