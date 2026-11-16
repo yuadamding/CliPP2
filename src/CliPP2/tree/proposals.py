@@ -1,6 +1,8 @@
-"""Separate connected-boundary and bounded fixed-K membership proposal policies."""
+"""Tree initialization followed by recurring general-partition exploration."""
 
+from collections import deque
 from dataclasses import dataclass
+from itertools import combinations
 from time import perf_counter
 
 import numpy as np
@@ -323,7 +325,7 @@ def _retained_bytes(candidates, bank):
     }
 
 
-def expand_memberships(model, bank, *, work=None):
+def _seed_memberships(model, bank, *, work=None):
     """Append at most eight general proposal slots per represented q.
 
     The original bank is frozen for selecting <=2 starts per count. Each
@@ -442,3 +444,308 @@ def expand_memberships(model, bank, *, work=None):
             "paths": paths, "counter_deltas": delta, "seconds": perf_counter() - started,
             "additional_retained_bytes": retained,
             "exhaustive_membership_search": False}
+
+
+def pilot_split_proposals(labels, pilot):
+    """Input-only, nonempty within-group splits; no minimum biological size.
+
+    Each regional coordinate supplies its largest-gap and median-gap split.
+    Equal pilot coordinates are never separated by an arbitrary row ordering.
+    Missing pilot coordinates receive the group's observed median solely for
+    proposing membership; ordinary structural/refit checks remain authoritative.
+    """
+    labels, pilot = np.asarray(labels, dtype=np.int64), np.asarray(pilot, dtype=float)
+    if labels.ndim != 1 or pilot.ndim != 2 or len(labels) != len(pilot):
+        raise ValueError("Pilot splits require aligned labels and regional vectors")
+    levels = np.unique(labels)
+    if not np.array_equal(levels, np.arange(len(levels))):
+        raise ValueError("Pilot splits require consecutive occupied labels")
+    q, seen = len(levels), set()
+    groups = sorted(levels, key=lambda k: (-int(np.count_nonzero(labels == k)), int(k)))
+    for group in groups:
+        members = np.flatnonzero(labels == group)
+        if len(members) < 2:
+            continue
+        for region in range(pilot.shape[1]):
+            values = pilot[members, region]
+            finite = np.isfinite(values)
+            if not finite.any():
+                continue
+            values = np.where(finite, values, np.median(values[finite]))
+            order = np.argsort(values, kind="stable")
+            gaps = np.diff(values[order])
+            distinct = np.flatnonzero(gaps > 0.)
+            if not len(distinct):
+                continue
+            for rule, boundary in (
+                    ("largest_gap", int(np.argmax(gaps))),
+                    ("median_gap", int(distinct[np.argmin(abs(distinct+1-len(members)/2))]))):
+                proposed = labels.copy()
+                proposed[members[order[boundary+1:]]] = q
+                key = canonical_partition(proposed).tobytes()
+                if key not in seen:
+                    seen.add(key)
+                    yield proposed, {"group": int(group), "region": region,
+                                     "rule": rule, "gap": float(gaps[boundary])}
+
+
+def _proposal_start(model, labels, centers, pilot, changed=()):
+    """Keep unchanged starts; initialize changed birth/merge groups from pilots."""
+    levels, inverse = np.unique(labels, return_inverse=True)
+    starts = np.empty((len(levels), model.r))
+    for index, label in enumerate(levels):
+        members = np.flatnonzero(inverse == index)
+        lower = np.max(model.lower[members], axis=0)
+        upper = np.min(model.upper[members], axis=0)
+        if label < len(centers) and label not in changed:
+            start = np.array(centers[label], copy=True)
+        else:
+            values = pilot[members]
+            finite = np.isfinite(values)
+            start = np.divide(np.where(finite, values, 0.).sum(axis=0), finite.sum(axis=0),
+                              out=(lower+upper)/2, where=finite.any(axis=0))
+        # Empty boxes/support are rejected by the ordinary refitter, not turned
+        # into a new membership restriction or an invalid incumbent exception.
+        starts[index] = np.clip(start, np.minimum(lower, upper), np.maximum(lower, upper))
+    return inverse, starts
+
+
+def _transfer_stream(labels, centers, columns, observed, keys, positive):
+    """Order transfers by old-center gain without treating its sign as a bound."""
+    n, q = columns.shape
+    if np.isnan(columns).any() or np.isposinf(columns).any():
+        raise ValueError("Transfer columns must be finite or negative infinity")
+    assigned = columns[np.arange(n), labels]
+    if not np.isfinite(assigned).all():
+        raise ValueError("Transfer parent has an impossible assigned center")
+    sizes = np.bincount(labels, minlength=q)
+    counts = np.zeros((q, observed.shape[1]), dtype=np.int64)
+    np.add.at(counts, labels, observed)
+    legal = (sizes[labels] > 1) & np.all(counts[labels]-observed > 0, axis=1)
+    gains = columns - assigned[:, None]
+    allowed = (gains > 0 if positive else gains <= 0) & legal[:, None]
+    allowed[np.arange(n), labels] = False
+    rows, destinations = np.nonzero(allowed)
+    descriptors = [(tuple(sorted(keys[i] for i in np.flatnonzero(labels == k))),
+                    tuple(map(float, centers[k]))) for k in range(q)]
+    ranks = {value: rank for rank, value in enumerate(sorted(set(descriptors)))}
+    order = sorted(range(len(rows)), key=lambda j: (
+        -float(gains[rows[j], destinations[j]]), keys[rows[j]],
+        ranks[descriptors[destinations[j]]], int(rows[j])))
+    for j in order:
+        row, destination = int(rows[j]), int(destinations[j])
+        gain = float(gains[row, destination])
+        proposed = labels.copy()
+        proposed[row] = destination
+        yield proposed, {"row": row, "source": int(labels[row]), "destination": destination,
+                         "old_center_gain": gain if np.isfinite(gain) else None,
+                         "old_center_impossible": not np.isfinite(gain)}
+
+
+def general_proposal_streams(model, candidate, pilot, keys, max_clusters):
+    """Lazy streams shared by CPU/CUDA; every retained stream can be widened.
+
+    Each item is ``(labels, initial_centers, detail)``. Columns are evaluated by
+    the requested numerical backend, then gathered for common host ordering.
+    The CUDA positive-only shortcut is not used by this recurring phase.
+    """
+    labels, centers = np.asarray(candidate.fit.labels), np.asarray(candidate.fit.centers)
+    q = len(centers)
+    columns = model.fit_column_set(centers).materialize()
+    if columns.shape != (model.n, q):
+        raise ValueError("General proposals require the complete mutation-by-center matrix")
+    pairs = sorted(combinations(range(q), 2), key=lambda pair: (
+        float(np.sum((centers[pair[0]]-centers[pair[1]])**2)), pair))
+
+    def births():
+        if q < max_clusters:
+            for proposed, detail in pilot_split_proposals(labels, pilot):
+                yield (*_proposal_start(model, proposed, centers, pilot, (detail["group"], q)), detail)
+
+    def merges():
+        for a, b in pairs:
+            proposed = np.where(labels == b, a, labels)
+            yield (*_proposal_start(model, proposed, centers, pilot, (a,)), {"groups": (a, b)})
+
+    def transfers(positive):
+        for proposed, detail in _transfer_stream(labels, centers, columns, model.observed, keys, positive):
+            yield (*_proposal_start(model, proposed, centers, pilot), detail)
+
+    def split_merges():
+        if q >= 3:
+            for split, detail in pilot_split_proposals(labels, pilot):
+                group = detail["group"]
+                for a, b in pairs:
+                    if group not in (a, b):
+                        proposed = np.where(split == b, a, split)
+                        yield (*_proposal_start(model, proposed, centers, pilot, (a, group, q)),
+                               {**detail, "merged_groups": (a, b)})
+
+    # Separate alternating streams reserve opportunities for nonpositive moves
+    # even when the positive list or the atomic split/merge list is very long.
+    return {"birth": births(), "nonpositive_transfer": transfers(False),
+            "merge": merges(), "positive_transfer": transfers(True),
+            "split_merge": split_merges()}
+
+
+def _state_key(candidate):
+    fit = candidate.fit
+    return canonical_partition(fit.labels).tobytes(), fit.centers.tobytes(), fit.weights.tobytes()
+
+
+def _diverse_states(candidates, width):
+    ordered = sorted(candidates, key=score_key)
+    chosen, memberships, states = [], set(), set()
+    for distinct_membership in (True, False):
+        for candidate in ordered:
+            key = _state_key(candidate)
+            if key in states or (distinct_membership and key[0] in memberships):
+                continue
+            chosen.append(candidate)
+            states.add(key)
+            memberships.add(key[0])
+            if len(chosen) == width:
+                return chosen
+    return chosen
+
+
+def explore_memberships(model, bank, *, work=None, max_clusters=None, max_proposals=None):
+    """Recurring split/merge exploration around a retained admissible bank.
+
+    A work budget bounds evaluated proposals, not elapsed time. Dynamic per-Q
+    frontiers preserve distinct partitions and fitted starts; every newly useful
+    general state can generate further births, transfers, merges or atomic
+    split/merges. No evaluated eligible incumbent is removed from the bank.
+    """
+    if not bank.candidates:
+        raise ValueError("General search requires an eligible initial candidate bank")
+    max_clusters = (work.limits["native"] if max_clusters is None and work is not None
+                    else model.n if max_clusters is None else max_clusters)
+    if type(max_clusters) is not int or not 1 <= max_clusters <= model.n:
+        raise ValueError("General search capacity must be an integer within retained N")
+    available = (POLICY.general_slots_per_k*max_clusters if work is None else
+                 work.limits["general"]-work.used["general"])
+    if max_proposals is None:
+        max_proposals = available
+    if type(max_proposals) is not int or not 0 <= max_proposals <= available:
+        raise ValueError("General proposal budget exceeds available declared work")
+    started = perf_counter()
+    original_count, winner = len(bank.candidates), bank.best_overall
+    pilot, _ = model.pilots()
+    keys = tuple(model.observation_keys())
+    frontiers, contexts, finished, scheduled = {}, {}, set(), set()
+    slots, expanded, admitted, pruned = 0, 0, 0, 0
+    routes = ("birth", "nonpositive_transfer", "merge", "positive_transfer", "split_merge")
+    queues = {route: deque() for route in routes}
+    turns = deque(routes)
+    operator_slots = dict.fromkeys(routes, 0)
+    operator_eligible = dict.fromkeys(routes, 0)
+    before = _counter_snapshot(model, bank)
+
+    def offer(candidate):
+        nonlocal pruned
+        q = len(candidate.fit.centers)
+        if q > max_clusters:
+            raise ValueError("General search candidate exceeds requested cluster capacity")
+        previous = frontiers.get(q, ())
+        selected = _diverse_states((*previous, candidate), POLICY.general_width)
+        selected_keys = {_state_key(value) for value in selected}
+        for value in previous:
+            key = _state_key(value)
+            if key not in selected_keys and key in contexts:
+                contexts.pop(key)
+                finished.add(key)
+                pruned += 1
+        frontiers[q] = selected
+        for value in selected:
+            key = _state_key(value)
+            if key not in scheduled and key not in finished:
+                for route in routes:
+                    queues[route].append((key, value))
+                scheduled.add(key)
+
+    def retained(key, candidate):
+        return key not in finished and any(_state_key(value) == key
+            for value in frontiers[len(candidate.fit.centers)])
+
+    for candidate in sorted(bank.candidates, key=score_key):
+        offer(candidate)
+    while any(queues.values()) and slots < max_proposals:
+        route = turns.popleft()
+        turns.append(route)
+        queue = queues[route]
+        while queue and not retained(*queue[0]):
+            queue.popleft()
+        if not queue:
+            continue
+        key, parent = queue.popleft()
+        context = contexts.get(key)
+        if context is None:
+            streams = general_proposal_streams(model, parent, pilot, keys, max_clusters)
+            context = contexts[key] = (set(streams), streams, bank.prepare(
+                parent.cuts, parent.fit.labels, fitted=parent.fit,
+                columns=model.selection_column_set(parent.fit.centers)))
+            expanded += 1
+        pending, streams, prepared = context
+        exhausted = False
+        for _ in range(min(POLICY.general_batch, max_proposals-slots)):
+            try:
+                labels, centers, detail = next(streams[route])
+            except StopIteration:
+                exhausted = True
+                break
+            slots += 1
+            operator_slots[route] += 1
+            if work is not None:
+                work.spend("general")
+            candidate = bank.consider_membership(labels, centers, {
+                "route": "recurring_general_"+route, "parent_state_index": parent.state_index,
+                "parent_score": parent.score, "occupied_q": len(centers),
+                "requested_k": max_clusters, **detail,
+            }, parent=prepared)
+            if candidate is not None:
+                admitted += 1
+                operator_eligible[route] += 1
+                offer(candidate)
+        if exhausted:
+            pending.remove(route)
+        elif key not in finished:
+            queue.append((key, parent))
+        if not pending:
+            contexts.pop(key, None)
+            finished.add(key)
+    if bank.best_overall.score > winner.score:
+        raise AssertionError("General search lost its original admissible incumbent")
+    active = len({key for queue in queues.values() for key, parent in queue
+                  if retained(key, parent)})
+    stop_reason = "budget_exhausted" if active else "implemented_proposals_exhausted"
+    after = _counter_snapshot(model, bank)
+    return {"applied": True, "method": "recurring_general_split_merge_v1",
+            "status": stop_reason, "stop_reason": stop_reason,
+            "exhaustion_scope": "retained_dynamic_frontier_not_all_possible_partitions",
+            "original_candidate_count": original_count, "original_winner_score": winner.score,
+            "best_score": bank.best_overall.score, "max_clusters": max_clusters,
+            "frontier_width_per_q": POLICY.general_width, "batch_per_operator": POLICY.general_batch,
+            "operator_schedule": "global_round_robin_with_separate_nonpositive_queue",
+            "proposal_limit": max_proposals, "proposal_slots": slots,
+            "operator_slots": operator_slots, "operator_eligible": operator_eligible,
+            "expanded_states": expanded, "eligible_callbacks": admitted,
+            "added_candidates": len(bank.candidates)-original_count,
+            "pruned_unfinished_states": pruned, "remaining_frontier_states": active,
+            "counter_deltas": {group: {name: value-before[group].get(name, 0)
+                for name, value in values.items()} for group, values in after.items()},
+            "proposal_backend": "common_host_ordering_of_requested_device_columns",
+            "positive_gain_is_exclusion": False,
+            "exhaustive_membership_search": False, "local_optimality_certified": False,
+            "seconds": perf_counter()-started}
+
+
+def expand_memberships(model, bank, *, work=None, max_clusters=None, max_proposals=None):
+    """Preserve the former complete winner, then explore general partitions."""
+    started = perf_counter()
+    seed = _seed_memberships(model, bank, work=work)
+    result = explore_memberships(model, bank, work=work, max_clusters=max_clusters,
+                                 max_proposals=max_proposals)
+    result["incumbent_initializer"] = seed
+    result["seconds"] = perf_counter()-started
+    return result

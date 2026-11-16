@@ -12,7 +12,8 @@ DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 DEFAULT_DEVICE: Final = "cpu"
 DEFAULT_MISSING_COUNTS: Final = "zero_alt"
 PROTOCOL_VERSION: Final = "2.5"
-STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_one_source_v1"
+STAGE_TWO_CLONAL_MERGE_DISTANCE: Final = 0.05
+STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_two_l2_lt_0p05_v2"
 ASSIGNMENT_METHODS: Final = ("marginal", "profile")
 SELECTION_CRITERION: Final = "marginal_mixture_bic_at_fitted_centers_v1"
 

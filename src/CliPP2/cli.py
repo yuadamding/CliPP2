@@ -12,7 +12,7 @@ from ._version import __version__
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2", allow_abbrev=False,
-        description="Fit the free-center tree-proposed joint-region multiplicity-mixture estimator.",
+        description="Fit joint regional CCFs with tree-seeded recurring partition search.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -63,6 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--normal-cn-policy", choices=["diploid"])
     audit.add_argument("--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN)
     audit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS)
+    experiment = subparsers.add_parser("experiment-mixture", allow_abbrev=False,
+        help="CPU-only research: jointly fit mixture centers/weights from a saved marginal fit.")
+    experiment.add_argument("--catalog", required=True, help="Saved original_catalog.json.")
+    experiment.add_argument("--accepted-fit", required=True, help="Saved Stage 1 or Stage 2 accepted fit.")
+    experiment.add_argument("--output", required=True, help="New experimental JSON; not a workflow fit.")
+    experiment.add_argument("--max-clusters", type=int, default=None,
+                            help="Mixture component cap; defaults to the saved fit's search cap.")
+    experiment.add_argument("--proposal-budget", type=int, default=32)
+    experiment.add_argument("--cpu-threads", type=int, default=1)
     return parser
 
 
@@ -87,6 +96,12 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.command == "experiment-mixture":
+        from .experimental import run_mixture_experiment
+        run_mixture_experiment(args.catalog, args.accepted_fit, args.output,
+            max_clusters=args.max_clusters, proposal_budget=args.proposal_budget,
+            cpu_threads=args.cpu_threads)
+        return
     if args.command == "audit-input":
         from .io.tumor_txt import audit_input
         from .io.publication import publish_json

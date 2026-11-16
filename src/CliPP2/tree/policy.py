@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class SearchPolicy:
-    name: str = "bounded_diverse_search_v3"
+    name: str = "recurring_general_search_v4"
     tree_width: int = 4
     repair_width: int = 2
     split_slots: int = 32
@@ -13,12 +13,17 @@ class SearchPolicy:
     boundary_slots: int = 16
     polish_starts_per_q: int = 2
     polish_rounds: int = 2
+    # The old bounded polish remains an incumbent-preserving initializer.
+    general_width: int = 2
+    general_slots_per_k: int = 256
+    general_batch: int = 8
 
     def limits(self, k):
         return {"native": k, "repair": self.repair_width*k*(k-1)//2,
                 "coarsening": self.tree_width*k*(k-1)//2,
                 "boundary": self.tree_width*self.boundary_slots*k,
                 "polishing": self.polish_starts_per_q*self.polish_rounds*2*k,
+                "general": self.general_slots_per_k*k,
                 "split": self.split_slots, "exchange": self.exchange_slots}
 
 

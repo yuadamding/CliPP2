@@ -1,4 +1,4 @@
-"""CliPP2: free-center frozen-tree clustering of regional mutation CCF profiles."""
+"""CliPP2: free-center joint regional clustering with recurring partition search."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ _EXPORTS = {
     "derive_assignment_bundle": ".assignment",
     "AcceptedFit": ".workflow",
     "run_workflow": ".workflow",
+    "run_mixture_experiment": ".experimental",
 }
 
 __all__ = [*_EXPORTS, "__version__"]

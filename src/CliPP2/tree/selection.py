@@ -1,4 +1,4 @@
-"""Bounded tree exploration and joint membership reassignment."""
+"""Tree initialization and recurring general-partition exploration."""
 
 from dataclasses import dataclass
 from time import perf_counter
@@ -464,7 +464,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     if not bank.candidates:
         reasons = sorted({entry["reason"] for entry in bank.ineligible.values()})
         raise ValueError(f"No supported finite-score tree candidate: {reasons}")
-    # Finish the entire original bank before broadening the membership family.
+    # Keep the tree baseline distinct from the complete legacy polish winner,
+    # which expand_memberships preserves before recurring general exploration.
     bank.original_selected = bank.best_overall
     original_count = len(bank.candidates)
     from .proposals import expand_memberships
@@ -498,7 +499,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
                   for c in bank.candidates if c.membership_kind == "general"}
     label_bytes = sum(map(len, label_keys.values()))
     diagnostics = {
-        "diagnostics_schema_version": 4,
+        "diagnostics_schema_version": 5,
         "pipeline": ALGORITHM,
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
         "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,

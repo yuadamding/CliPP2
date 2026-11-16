@@ -10,14 +10,18 @@ Stages 1 and 2; they do not introduce a mixed-state likelihood.
 Protocol **2.5** chooses a provisional Stage 1 source, then fits the remainder
 using segment caps from that source's multiplicity estimates. By default, each
 mutation's multiplicities differ by at most one across informative regions.
+After Stage 2, clusters with CCF-vector L2 distance **<0.05** from `(1,1,…)`
+merge into clonal cluster **0**, fixed at `(1,1,…)`. Other centers stay unchanged.
 Stage 3 restores original support and reassesses every fitted mutation against
-one fixed all-one clonal reference and the distinct Stage 2 centers.
+this consolidated reference set. Native fit records remain unchanged as provenance.
 
 Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
 has no automatic eligibility ceiling. Explicit input exclusions, model-domain
-checks and numerical verification remain. Stage 1–2 fitting ends after the
-bounded search and reassignment proposals, followed by BIC selection. It does
-not run exhaustive single-mutation membership audits or certify local optimality.
+checks and numerical verification remain. Stage 1–2 preserves the tree-search
+winner, then repeatedly explores general-partition births, transfers of both
+signs, merges and atomic split–merge moves under the same refitter and BIC.
+The bounded search reports budget or proposal exhaustion; neither certifies
+local or global optimality. It does not run exhaustive membership audits.
 Package **2.2.0** implements scientific protocol **2.5**. The
 [protocol specification](docs/workflow_protocol_2_5.md) defines the likelihood,
 BIC, multiplicity constraints, and saved-state contracts.
@@ -32,7 +36,7 @@ clipp2 fit --input-dir examples/tumor --max-clusters 3 --output-dir results/exam
 ```
 
 The [examples](examples/README.md) also show the plan for a complete three-stage
-workflow. Its outputs include native Stage 1/2 fits, provisional-source provenance, exact reference consolidation, segment caps,
+workflow. Its outputs include native Stage 1/2 fits, provisional-source provenance, clonal-reference merging, segment caps,
 reference vectors, method-specific scores, MAP tie sets and raw diagnostics.
 Marginal assignment also reports cluster posterior probabilities; profile does not.
 `all_original_mutations.tsv` retains every mutation and its final assignment or
@@ -46,6 +50,20 @@ and no data-supported final label; all-impossible candidates instead yield
 | Standalone native fit | `clipp2 fit --input-file INPUT.tsv --output-dir OUTPUT` |
 | Input audit | `clipp2 audit-input --input-file INPUT.tsv --output AUDIT.json` |
 | Frozen-reference reassignment | `clipp2 assign --bundle BUNDLE.json --output-dir OUTPUT` |
+
+An opt-in **CPU-only research estimator**, separate from the workflow, jointly
+fits mixture centers and weights to observed marginal likelihood:
+
+```sh
+clipp2 experiment-mixture --catalog RUN/original_catalog.json \
+  --accepted-fit RUN/stage_two_accepted.json --output experiment.json
+```
+
+It preserves the saved population and support, uses soft responsibilities, and
+reports positive-weight components separately from occupied MAP labels. Its BIC
+counts positive components. The experimental JSON cannot replace an accepted
+workflow fit; no hard refit is performed after MAP labeling. Better likelihood
+or BIC does not establish better biological accuracy or CUDA qualification.
 
 Stage 3 defaults to **marginal** likelihood. Set
 `workflow_config.stage_three_assignment_method` to `"profile"` to maximize the

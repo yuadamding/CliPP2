@@ -13,7 +13,7 @@ import numpy as np
 from .assignment import (AssignmentBundle, AssignmentReference, EVIDENCE_STATUSES,
                          assign_mutations, joint_distribution)
 from .config import (PROTOCOL_VERSION, WorkflowConfig,
-                     STAGE_THREE_REFERENCE_POLICY)
+                     STAGE_THREE_REFERENCE_POLICY, STAGE_TWO_CLONAL_MERGE_DISTANCE)
 from ._version import __version__
 from .io.data import (ImmutableArrayRecord, MultiplicityBounds, content_hash, freeze_record as _freeze,
                       json_value as _json_value, readonly_array)
@@ -198,7 +198,7 @@ class AcceptedFit(ImmutableArrayRecord):
         from .kernel.model import FitResult, RegionalModel
         from .kernel.topology import Membership
         from .provenance import resolve_current_run_manifest_id
-        from .kernel import ALGORITHM, KERNEL_VERSION
+        from .kernel import ALGORITHM, COMPATIBLE_SEARCH_ALGORITHMS, KERNEL_VERSION
         from .kernel.model import MODEL_VERSION, INTERVAL_MODEL_VERSION
         run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
         producer = self.producer_receipt
@@ -210,7 +210,8 @@ class AcceptedFit(ImmutableArrayRecord):
                 or any(not isinstance(producer.get(key), str) or not producer[key]
                        or producer[key] != producer[key].strip()
                        for key in ("implementation_version", "algorithm", "model_version", "kernel_version", "model_identity"))
-                or producer.get("algorithm") != ALGORITHM or producer.get("kernel_version") != KERNEL_VERSION
+                or producer.get("algorithm") not in COMPATIBLE_SEARCH_ALGORITHMS
+                or producer.get("kernel_version") != KERNEL_VERSION
                 or producer.get("model_version") not in model_versions
                 or content_hash(producer.get("biological_identity")) != content_hash(self.biological_identity)
                 or not isinstance(producer.get("fit_config"), Mapping)
@@ -286,6 +287,7 @@ class AcceptedFit(ImmutableArrayRecord):
                 tumor_id=self.tumor_id, run_manifest_id=run_manifest_id,
                 originating_run_manifest_id=producer.get("run_manifest_id"),
                 originating_native_fit_protocol=self.protocol_version, current_workflow_protocol=PROTOCOL_VERSION,
+                originating_search_algorithm=producer["algorithm"], current_search_algorithm=ALGORITHM,
                 accepted_state_hash=self.state_fingerprint, model_identity=model.identity,
                 execution=model.execution_diagnostics(), refitted=False,
                 checks="biological_inputs_support_native_calls_independent_score")
@@ -472,7 +474,10 @@ def select_reference_source(groups):
 
 
 def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, group_two):
-    """Use one fixed clonal hypothesis; retain Stage 1's estimate as provenance."""
+    """Merge near-clonal Stage 2 sources into one fixed all-one reference.
+
+    Accepted native fits remain unchanged; lineage records the combined labels.
+    """
     selected = selected_group
     label = selected["source_label"]
     if label not in range(len(stage_one.centers)) or not np.any(stage_one.labels == label):
@@ -496,10 +501,11 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
             if (not np.array_equal(group["native_center"], center)
                     or group.get("source_stage", fit.source_id) != fit.source_id):
                 raise ValueError("Group diagnostics describe a different accepted native source")
-            # The selected Stage 1 source and the fixed clonal hypothesis are
-            # one reference, even when the fitted source is not exactly one.
-            # Other native centers are not geometrically merged or altered.
-            key = tuple(centers[0] if fit is stage_one else center)
+            distance = float(np.linalg.norm(center - 1))
+            clonal = fit is stage_one or distance < STAGE_TWO_CLONAL_MERGE_DISTANCE
+            # Compare the full native vector to one, never to another group or
+            # a moving centroid. The strict threshold is not region-normalized.
+            key = tuple(centers[0] if clonal else center)
             if key not in inventory:
                 inventory[key] = len(centers)
                 centers.append(center)
@@ -509,10 +515,12 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
             role = "provisional_reference_source" if fit is stage_one else "native_discovery_group"
             lineage = dict(source_stage=fit.source_id, source_label=source_label,
                 baseline_reference_label=baseline, reference_source_role=role,
-                native_center=center.tolist(), distance_to_one=float(np.linalg.norm(center - 1)))
+                native_center=center.tolist(), distance_to_one=distance)
             if fit is stage_one:
                 lineage["selection_rule"] = "nearest_to_one"
                 lineage["reference_center_policy"] = "fixed_all_ones"
+            elif clonal:
+                lineage["reference_center_policy"] = "stage_two_clonal_l2_merge"
             else:
                 lineage["reference_center_policy"] = "native_stage_two"
             source_map.append(lineage)
@@ -523,10 +531,10 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
                     "informative_counts", "informative_depths", "native_mean_profile_deviance",
                     "native_maximum_profile_deviance", "diagnostic_status") + ((
                     "all_one_mean_profile_deviance", "all_one_maximum_profile_deviance")
-                    if fit is stage_one else ())},
-                reference_measurement="all_one" if fit is stage_one else "native",
+                    if clonal else ())},
+                reference_measurement="all_one" if clonal else "native",
                 diagnostic_error=group.get("diagnostic_error")))
-            measurements[baseline].append((group, "all_one" if fit is stage_one else "native"))
+            measurements[baseline].append((group, "all_one" if clonal else "native"))
     counts, depths, means, maxima, availability = [], [], [], [], []
     for records in measurements:
         count = np.asarray([g["informative_counts"] for g, _ in records], float)
@@ -552,7 +560,7 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
         source_informative_count=np.asarray(counts), source_informative_depth=np.asarray(depths),
         source_mean_profile_deviance=np.asarray(means), source_maximum_profile_deviance=np.asarray(maxima),
         diagnostic_availability=availability,
-        center_sources=tuple(dict(center_source="single_clonal_and_exact_native_consolidation", sources=entries,
+        center_sources=tuple(dict(center_source="single_clonal_l2_and_exact_native_consolidation", sources=entries,
             diagnostic_aggregation="disjoint_native_source_members_or_declared_fixed_hypothesis_source") for entries in sources))
     g0 = tuple(mutation for mutation, label in zip(stage_one.mutation_ids, stage_one.labels)
                if label == selected["source_label"])
@@ -626,6 +634,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             if config.fit.max_multiplicity_difference == 1 else "read_floor_then_cap"),
         max_multiplicity_difference=config.fit.max_multiplicity_difference,
         reference_policy=STAGE_THREE_REFERENCE_POLICY,
+        clonal_merge_l2_threshold=STAGE_TWO_CLONAL_MERGE_DISTANCE,
         reassessment_policy="all_combined_fitted_mutations",
         provenance_policy="biological_and_numerical_identity_no_file_checksums")
     try:
@@ -797,8 +806,10 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         centers = reference.centers
         stage_two_members = set(targets) - reference_members
         q2 = 0 if stage_two is None else len(stage_two.centers)
-        receipt["counts"].update(merged_groups=0, clonal_source_consolidated=1,
-            exact_duplicate_centers=1 + q2 - len(centers),
+        merged_groups = sum(row["reference_center_policy"] == "stage_two_clonal_l2_merge"
+                            and row["distance_to_one"] > 0 for row in source_map)
+        receipt["counts"].update(merged_groups=merged_groups, clonal_source_consolidated=1,
+            exact_duplicate_centers=1 + q2 - len(centers) - merged_groups,
             combined_mutations=len(targets), K=len(centers),
             targets=len(targets), non_targets=0, unchanged_non_target=0)
         write_supporting_table(output / "source_to_reference.tsv", source_map)
@@ -826,8 +837,10 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             max_multiplicity_difference=config.fit.max_multiplicity_difference,
             normal_cn_policy=config.normal_cn_policy, run_manifest_id=run_manifest_id,
             provenance=dict(stage_two_caps_hash=caps.content_hash,
-                 reference_contributors=reference_audit, native_stage_two_centers_preserved=True,
+                 reference_contributors=reference_audit, native_stage_two_centers_preserved=not merged_groups,
+                 accepted_native_fits_preserved=True,
                  reference_policy=STAGE_THREE_REFERENCE_POLICY,
+                 clonal_merge_l2_threshold=STAGE_TWO_CLONAL_MERGE_DISTANCE,
                  run_manifest_identity=run_manifest["manifest_identity"]))
         save_assignment_bundle(bundle, output / "assignment_bundle.json")
         receipt["current_phase"] = "stage_three_assignment"
@@ -843,6 +856,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         original_rows, final_accounting = _reconcile_final_memberships(
             catalog, stage_one, stage_two, source_map, assignment, contributors=reference_audit)
         receipt.update(final_accounting=final_accounting, bundle_hash=bundle.content_hash,
+                       reference_consolidation_is_refit=False,
                        exact_reference_consolidation_is_refit=False)
         receipt["counts"].update(reassessment)
         receipt["current_phase"] = "whole_original_publication"

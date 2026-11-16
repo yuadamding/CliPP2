@@ -135,9 +135,20 @@ binomial maxima, including binomial coefficients, without prior normalization.
 
 ## Model selection and Stage 3
 
-Stages 1 and 2 select the lowest BIC in the retained candidate bank after bounded
-tree exploration and reassignment proposals. They do not run exhaustive
-single-mutation membership refinement or publish local-optimum certificates.
+Stages 1 and 2 retain the previous tree/coarsening/reassignment winner as an
+initializer, then recur over general partitions: pilot-based births inside
+existing groups, individual transfers with positive or nonpositive old-center
+gain, all-pair merges, and atomic merge-two/split-third moves. Conditional refits
+and full-population mixture scoring are unchanged. A diverse frontier keeps up
+to two states per cluster count; all eligible evaluated states remain in the
+final BIC comparison. The additional budget is `256 * max_clusters` proposal
+slots, shared across the five round-robin operators. Distinct initial centers
+remain distinct refit requests. Nonimproving intermediate states can advance
+through the frontier, but this is not an exhaustive search.
+
+Termination distinguishes budget exhaustion from exhaustion of implemented
+proposals on the retained frontier, not all possible partitions. Neither is a
+local-optimum certificate; no exhaustive single-mutation audit is performed.
 Selected-fit numerical verification and candidate-bank reconciliation remain
 mandatory. Stage 3 independently verifies its fixed-reference assignments.
 
@@ -153,6 +164,32 @@ marginal-mixture selection at its fitted centers. This remains a BIC-form hybrid
 criterion with data-derived supports and conditional center fitting, not a claim
 of joint mixture-center optimization or new BIC consistency.
 
+### Separate experimental mixture estimator
+
+`experiment-mixture` uses an independently validated saved marginal fit only as
+an initializer and support/population specification. It optimizes
+$\sum_i\log\sum_k\pi_k e^{A_i(\boldsymbol\phi_k)}$ jointly in centers and weights,
+with soft cluster responsibilities and conditional joint-multiplicity
+posteriors. Weighted concave binomial coordinate M-steps, exact endpoint
+derivatives, an interior start and actual-likelihood refinement preserve
+nondecreasing likelihood and require a projected-gradient stopping check.
+The normalized center residual is bounded by `1e-5`; weights pass the existing
+weight optimizer's independent stationarity gates. Iteration exhaustion is a
+failed candidate, not convergence. This remains a local, CPU-only research fit.
+
+Its separate bounded search proposes births, transfer-derived starts, merges
+and atomic split–merges. Positive-weight components without MAP-assigned
+mutations are retained; exact-zero weights are not replaced with arbitrary
+epsilon. BIC uses the positive component count, while MAP occupancy is reported
+separately. No hard-partition center refit follows MAP assignment. Experimental
+JSON is deliberately not an `AcceptedFit` and cannot silently enter Stage 3.
+The production workflow above remains the conditional-center estimator.
+
+Saved `regional_bounded_search_v7` fits remain numerically replayable because
+their model/refitter is unchanged. Their original algorithm, source receipt
+and state fingerprint are preserved, with a separate current compatibility
+check; replay does not relabel them as newly searched fits.
+
 Stage 1 selects a provisional source nearest all ones. Donor multiplicities use
 the projections of the complete joint MAP set, taking each regional projection's
 upper endpoint and then the minimum across eligible donors in that region-segment.
@@ -160,8 +197,22 @@ Mapping, observation and exclusion conditions remain in force, and CCF must be
 positive. The representative joint MAP vector is selected deterministically in
 regional lexicographic order.
 
-Stage 3 freezes one all-one reference plus distinct Stage 2 centers and reassesses
-all fitted mutations. Its scores are $A_i-\log K$ or $P_i-\log K$. Marginal ties
+After Stage 2, every native center with $\|\boldsymbol\phi_k-\mathbf1_R\|_2<0.05$
+is merged into the fixed all-one clonal reference, label 0. The threshold is
+strict and uses the full vector without division by the number of regions;
+centers at distance 0.05 or greater remain unchanged. Other exact duplicate
+centers are consolidated as before. This is postprocessing, not a new fit:
+native accepted centers, memberships, scores and multiplicities remain intact.
+`source_to_reference.tsv` and `baseline_reference_label` record the combined
+Stage 2 labels; `reference_vectors.tsv` gives their centers. Diagnostics for
+merged sources are evaluated at all ones, with native diagnostics retained.
+`merged_groups` counts non-exact near-clonal Stage 2 groups; exact duplicates
+are counted separately. The reference-policy identity binds this rule, and
+existing frozen assignment bundles retain their original reference sets.
+
+Stage 3 freezes this consolidated set and reassesses all fitted mutations; the
+merge does not lock their final assignments. Its scores are $A_i-\log K$ or
+$P_i-\log K$. Marginal ties
 use the lowest label. Profile ties retain the baseline when it is in the exact
 maximizing set, otherwise the lowest label. Profile scores are not posterior
 probabilities. Prior-only and all-impossible rows retain their explicit statuses.
