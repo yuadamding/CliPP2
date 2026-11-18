@@ -1,4 +1,4 @@
-"""CliPP2 observed-mixture weights at fixed conditionally fitted centers."""
+"""CliPP2 observed-mixture weights at fixed emission columns."""
 # Adapted from CliPP1.5.
 
 import numpy as np
@@ -32,9 +32,8 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     This is a concave weight problem. The reported Frank-Wolfe gap bounds the
     remaining log-likelihood improvement at these centers, even with duplicate
     centers or boundary weights. Zero weights are returned for explicit repair
-    by the caller; this optimizer does not change partition memberships.
-    Center fitting itself remains conditional on the supplied hard partition;
-    this function does not claim a joint mixture-center maximum.
+    by the caller. This solves only the weight problem for the permitted
+    columns, not the joint center problem or model selection.
     """
     def record(name, amount=1):
         if telemetry is not None:

@@ -12,10 +12,11 @@ dependencies = [
     "numpy>=1.21",
     "pandas>=1.5",
     "scipy>=1.10",
+    "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.12"]
+dev = ["ruff>=0.12", "pytest>=7"]
 
 [project.scripts]
 clipp2 = "CliPP2.cli:main"
@@ -29,17 +30,6 @@ include = ["CliPP2*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "CliPP2._version.__version__" }
-
-[tool.setuptools.package-data]
-CliPP2 = [
-    "kernel/csrc/*.cpp",
-    "kernel/csrc/*.h",
-    "kernel/csrc/common/*.h",
-    "kernel/csrc/cpu/*.cpp",
-    "kernel/csrc/cpu/*.h",
-    "kernel/csrc/cuda/*.cu",
-    "kernel/csrc/cuda/*.cuh",
-]
 
 [tool.ruff]
 target-version = "py310"

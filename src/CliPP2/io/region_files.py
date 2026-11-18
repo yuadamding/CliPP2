@@ -122,9 +122,8 @@ def _read_region(path: Path):
             encoded = json.dumps([dict(cn_state_id=state[2], cn_state_fraction=state[3],
                                        major_cn=state[4], minor_cn=state[5])
                                   for state in validated.records], separators=(",", ":"))
-        # The native likelihood still uses one original integer CN pair. Keep
-        # the state with the greatest (major, minor), preserving max major as
-        # the biological multiplicity ceiling; all states inform the floor.
+        # Keep the original representative (major, minor) for scaling and the
+        # clonal multiplicity ceiling. Other states are retained as provenance.
         major, minor, normal, normal_supplied, genuine, representative = max(
             states, key=lambda state: (state[0], state[1], str(state[5].get("cn_state_id", ""))))
         intervals.setdefault(chrom, []).append((start, end, major, minor, normal,

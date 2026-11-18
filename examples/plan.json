@@ -1,0 +1,8 @@
+{
+  "schema": "clipp2.workflow.plan.v8",
+  "protocol_version": "3.0",
+  "input_path": "tumor",
+  "workflow_config": {
+    "fit": {"cpu_threads": 1}
+  }
+}

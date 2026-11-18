@@ -1,42 +1,73 @@
-"""Fit and publish one native workflow stage."""
-from dataclasses import dataclass
+"""Independently validate a selected Protocol 3.0 fit before publication."""
 
-from .config import FitConfig
-from .io.data import MultiplicityBounds, readonly_array
-from .io.reporting import check_destination, public_label_order, publish
-from .kernel.model import RegionalModel
-from .production import fit_observations, require_supported_production
-from .tree.progress import ProgressReporter
+import numpy as np
+
+from .config import MODEL_ID, PROTOCOL_VERSION
+from .io.clonal_reporting import OUTPUT_SCHEMA, evaluate_fit, publish_stage
+from .io.data import content_hash
 
 
-@dataclass(frozen=True)
-class FitExecution:
-    fit: object
-    mutation_ids: tuple
-    region_ids: tuple
-    public_order: object
-    public_labels: object
-    multiplicities: object
-    support: MultiplicityBounds
+def stage_record(model, fit, result, catalog, stage):
+    certificate = {
+        name: fit.diagnostics[name]
+        for name in (
+            "requested_template",
+            "qualified_template",
+            "iterations",
+            "projected_gradient_residual",
+            "gradient_tolerance",
+            "weight_optimality_gap",
+            "weight_active_score_gap",
+        )
+    }
+    record = dict(
+        schema="clipp2.stage-fit.v2",
+        protocol_version=PROTOCOL_VERSION,
+        model=MODEL_ID,
+        output_schema=OUTPUT_SCHEMA,
+        stage=stage,
+        tumor_id=catalog.tumor_id,
+        catalog_content_hash=catalog.content_hash,
+        mutation_ids=model.mutation_ids,
+        region_ids=model.region_ids,
+        biological_count=fit.biological_count,
+        occupied_count=len(set(result.labels)),
+        component_labels=result.component_labels,
+        labels=result.labels,
+        centers=result.centers,
+        weights=result.weights,
+        clonal_prior_beta=result.clonal_prior_beta,
+        internal_to_biological=result.internal_to_biological,
+        internal_template=fit.template,
+        internal_weights=fit.weights,
+        free_centers=fit.centers,
+        log_likelihood=float(fit.log_likelihood),
+        parameter_count=result.parameter_count,
+        bic=float(fit.bic),
+        multiplicities=result.multiplicities,
+        stationarity=certificate,
+    )
+    return record | {
+        "state_identity": content_hash(
+            {k: v for k, v in record.items() if k != "stage"}
+        )
+    }
 
 
-def fit_prepared(data, outdir, config, *, multiplicity_support=None, progress_callback=None):
-    if type(config) is not FitConfig:
-        raise TypeError('fit_config must be a FitConfig')
-    require_supported_production(config)
-    if progress_callback is not None and not callable(progress_callback):
-        raise TypeError('progress_callback must be callable or None')
-    check_destination(outdir, data.tumor_id)
-    with RegionalModel(data, device=config.device, cpu_threads=config.cpu_threads,
-            multiplicity_support=multiplicity_support, fit_multiplicity=config.fit_multiplicity,
-            selection_criterion=config.selection_criterion,
-            max_multiplicity_difference=config.max_multiplicity_difference) as model:
-        progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
-        fit = fit_observations(model, config.max_clusters, progress=progress)
-        publish(model, fit, outdir, data.tumor_id, progress=progress)
-        order, labels = public_label_order(fit)
-        support = MultiplicityBounds(model.mutation_ids, model.region_ids,
-            model.multiplicity_min, model.multiplicity_max,
-            'original_support' if multiplicity_support is None else multiplicity_support.policy_id)
-        return FitExecution(fit, model.mutation_ids, model.region_ids, readonly_array(order),
-            readonly_array(labels), readonly_array(model.multiplicity(fit.centers[fit.labels])), support)
+def publish_selected(model, fit, catalog, outdir, stage, *, selected_from=None):
+    result = evaluate_fit(model, fit, catalog=catalog)
+    record = stage_record(model, fit, result, catalog, stage)
+    if selected_from is not None:
+        prior_assignment, prior_record = selected_from
+        if record["state_identity"] != prior_record[
+            "state_identity"
+        ] or not np.array_equal(
+            result.responsibilities, prior_assignment.responsibilities
+        ):
+            raise ValueError(
+                "Final biological assignments differ from the accepted Stage 2 model."
+            )
+    tables = publish_stage(
+        model, fit, result, outdir, include_probabilities=selected_from is not None
+    )
+    return result, record, tables

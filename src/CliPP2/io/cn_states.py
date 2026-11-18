@@ -1,7 +1,7 @@
-"""Validated segment CN-state fractions for multiplicity-bound estimation.
+"""Validated provenance for original segment CN-state fractions.
 
 These are fractions of all tumor cells, including cells without a mutation.
-They describe an estimator input, not the native single-state likelihood CN.
+The likelihood uses a representative original CN state, not these averages.
 """
 from __future__ import annotations
 

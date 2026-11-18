@@ -1,4 +1,4 @@
-"""CliPP2: A-initialized joint-mixture workflow with fixed-reference Stage 3."""
+"""CliPP2: one biological clonal and single-copy-free mixture model."""
 
 from __future__ import annotations
 

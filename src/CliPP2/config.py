@@ -1,70 +1,23 @@
-"""One immutable, fully resolved configuration for a CliPP2 fit."""
-
-from __future__ import annotations
+"""Protocol 3.0 configuration: one role-constrained likelihood."""
 
 from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Final
 
 DEFAULT_MAX_MAJOR_CN: Final = None
-DEFAULT_MAX_CLUSTERS: Final = 20
 DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
-DEFAULT_DEVICE: Final = "cpu"
+DEFAULT_MAX_CLUSTERS: Final = 20
 DEFAULT_MISSING_COUNTS: Final = "zero_alt"
-PROTOCOL_VERSION: Final = "2.5"
-STAGE_TWO_CLONAL_MERGE_DISTANCE: Final = 0.05
-STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_two_l2_lt_0p05_v2"
-ASSIGNMENT_METHODS: Final = ("marginal", "profile")
-SELECTION_CRITERION: Final = "marginal_mixture_bic_at_fitted_centers_v1"
+DEFAULT_PROPOSAL_BUDGET: Final = 32
+PROTOCOL_VERSION: Final = "3.0"
+PLAN_SCHEMA: Final = "clipp2.workflow.plan.v8"
+MODEL_ID: Final = "fixed_clonal_single_copy_free_v1"
 
 
 def validate_max_multiplicity_difference(value):
     if value is not None and (type(value) is not int or value != 1):
         raise ValueError("max_multiplicity_difference must be 1 or None (independent)")
     return value
-
-
-def fitting_identity(method="marginal", selection=SELECTION_CRITERION,
-                     max_multiplicity_difference=1):
-    if not isinstance(method, str) or method not in ("marginal", "profile"):
-        raise ValueError("fit_multiplicity must be marginal or profile")
-    if selection != SELECTION_CRITERION:
-        raise ValueError(f"selection_criterion must be {SELECTION_CRITERION}")
-    validate_max_multiplicity_difference(max_multiplicity_difference)
-    if max_multiplicity_difference == 1:
-        return {"fit_objective_id": ("joint_range_one_profile_v1" if method == "profile"
-                                     else "joint_range_one_marginal_v1"),
-                "selection_criterion_id": selection,
-                "initialization_policy_id": "joint_pooled_posterior_pilot_v1",
-                "scalar_refit_policy_id": ("joint_profile_coordinate_envelope_v1" if method == "profile"
-                                           else "joint_marginal_em_stationary_v1"),
-                "max_multiplicity_difference": 1,
-                "multiplicity_policy_id": "joint_range_one_v1",
-                "multiplicity_normalization_id": "uniform_joint_vectors_v1"}
-    return {"fit_objective_id": ("integer_multiplicity_profile_v1" if method == "profile"
-                                 else "uniform_multiplicity_marginal_v1"),
-            "selection_criterion_id": selection,
-            "initialization_policy_id": "existing_marginal_pooled_pilot_v1",
-            "scalar_refit_policy_id": ("profile_branch_interval_search_v1" if method == "profile"
-                                       else "marginal_grid_interval_search_v1"),
-            "max_multiplicity_difference": None,
-            "multiplicity_policy_id": "independent_regions_v1",
-            "multiplicity_normalization_id": "uniform_interval_width_v1"}
-
-
-def validate_assignment_method(value):
-    if not isinstance(value, str) or value not in ASSIGNMENT_METHODS:
-        raise ValueError("assignment_method must be marginal or profile")
-    return value
-
-
-def mixture_fitting_identity(selection=SELECTION_CRITERION, max_multiplicity_difference=1):
-    """Joint-mixture objective with fresh A initialization."""
-    identity = fitting_identity("marginal", selection, max_multiplicity_difference)
-    identity.update(fit_objective_id="observed_joint_marginal_mixture_v1",
-                    initialization_policy_id="fresh_A_conditional_tree_search_v1",
-                    scalar_refit_policy_id="soft_joint_em_stationary_v1")
-    return identity
 
 
 def validate_missing_counts(value):
@@ -74,7 +27,6 @@ def validate_missing_counts(value):
 
 
 def validate_max_major_cn(value: int | None) -> int | None:
-    """None keeps all valid CN; a positive integer declares a population cutoff."""
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
@@ -82,58 +34,62 @@ def validate_max_major_cn(value: int | None) -> int | None:
     return int(value)
 
 
+def _integer(value, name, *, minimum=1):
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}.")
+
+
 @dataclass(frozen=True, slots=True)
 class FitConfig:
-    """Public execution and CN eligibility options; numerical policy is fixed."""
+    """Discovery search and eligibility settings, not alternative estimators."""
 
-    device: str = DEFAULT_DEVICE
+    device: str = "cpu"
     max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN
-    max_clusters: int = DEFAULT_MAX_CLUSTERS
+    max_clusters: int = DEFAULT_STAGE_ONE_MAX_CLUSTERS
     cpu_threads: int | None = None
-    fit_multiplicity: str = "marginal"
-    selection_criterion: str = SELECTION_CRITERION
-    max_multiplicity_difference: int | None = 1
+    proposal_budget: int = DEFAULT_PROPOSAL_BUDGET
 
-    def __post_init__(self) -> None:
-        fitting_identity(self.fit_multiplicity, self.selection_criterion, self.max_multiplicity_difference)
-        if self.device not in ("cpu", "cuda"):
-            raise ValueError("device must be cpu or cuda.")
+    def __post_init__(self):
+        if self.device != "cpu":
+            raise ValueError("Protocol 3.0 supports only device='cpu'; no CUDA fallback.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
-        if type(self.max_clusters) is not int or self.max_clusters < 1:
-            raise ValueError("max_clusters must be a positive integer.")
-        if self.cpu_threads is not None and (
-                type(self.cpu_threads) is not int or not 1 <= self.cpu_threads <= 2**31 - 1):
-            raise ValueError("cpu_threads must be a positive int32 or None (auto).")
+        _integer(self.max_clusters, "max_clusters")
+        _integer(self.proposal_budget, "proposal_budget", minimum=0)
+        if self.cpu_threads is not None:
+            _integer(self.cpu_threads, "cpu_threads")
+            if self.cpu_threads > 2**31 - 1:
+                raise ValueError("cpu_threads must fit a positive int32.")
 
 
 @dataclass(frozen=True, slots=True)
 class WorkflowConfig:
-    """Stage-specific search limits and the unchanged assignment policy."""
+    """Discovery and refinement capacities count biological clusters."""
 
-    fit: FitConfig = field(default_factory=lambda: FitConfig(
-        device="cpu", max_clusters=DEFAULT_STAGE_ONE_MAX_CLUSTERS))
+    fit: FitConfig = field(default_factory=FitConfig)
     stage_two_max_clusters: int = DEFAULT_MAX_CLUSTERS
+    stage_two_proposal_budget: int = DEFAULT_PROPOSAL_BUDGET
     normal_cn_policy: str | None = None
     missing_counts: str = DEFAULT_MISSING_COUNTS
-    stage_three_assignment_method: str = "marginal"
 
     def __post_init__(self):
-        validate_assignment_method(self.stage_three_assignment_method)
-        validate_missing_counts(self.missing_counts)
         if type(self.fit) is not FitConfig:
-            raise TypeError("Workflow requires a validated FitConfig")
+            raise TypeError("Workflow requires a validated FitConfig.")
+        _integer(self.stage_two_max_clusters, "stage_two_max_clusters")
+        _integer(self.stage_two_proposal_budget, "stage_two_proposal_budget", minimum=0)
         if self.normal_cn_policy not in (None, "diploid"):
-            raise ValueError("normal_cn_policy must be None or the explicit 'diploid' assumption")
-        if type(self.stage_two_max_clusters) is not int or self.stage_two_max_clusters < 1:
-            raise ValueError("stage_two_max_clusters must be a positive integer")
+            raise ValueError("normal_cn_policy must be None or 'diploid'.")
+        validate_missing_counts(self.missing_counts)
 
     @classmethod
     def from_dict(cls, values):
-        values = dict(values)
-        fit_values = dict(device="cpu", max_clusters=DEFAULT_STAGE_ONE_MAX_CLUSTERS)
-        fit_values.update(values.get("fit", {}))
-        values["fit"] = FitConfig(**fit_values)
-        return cls(**values)
+        if not isinstance(values, dict) or not isinstance(values.get("fit", {}), dict):
+            raise ValueError("workflow_config and its optional fit field must be objects.")
+        incompatible = (
+            {"fit_multiplicity", "selection_criterion", "max_multiplicity_difference"} & values.get("fit", {}).keys()
+        ) | ({"stage_three_assignment_method"} & values.keys())
+        if incompatible:
+            raise ValueError(f"Protocol 3.0 removed these fit/assignment options: {sorted(incompatible)}")
+        return cls(**(values | {"fit": FitConfig(**values.get("fit", {}))}))
 
 
 __all__ = ["FitConfig", "WorkflowConfig"]
