@@ -1,4 +1,4 @@
-"""Deterministic starts and bounded discovery for the single-copy mixture."""
+"""Deterministic starts and bounded discovery for the fixed-multiplicity mixture."""
 from collections import Counter, deque
 from dataclasses import dataclass
 from itertools import combinations
@@ -25,7 +25,7 @@ class _Start:
 
 def _interior(centers):
     # Only starts are nudged. The optimizer sees the full closed [0,1] box.
-    # In particular, no seed is converted to fixed V before it can move.
+    # In particular, no seed is converted to fixed C before it can move.
     return np.clip(centers, 1e-4, 1.-1e-4)
 
 
@@ -116,7 +116,7 @@ def _key(template, centers, weights):
                          for row, w in zip(centers, weights[len(template):]))))
 
 
-def _proposals(model, geometry, parent, family, capacity, templates):
+def _proposals(model, geometry, parent, family, capacity):
     template, centers, weights = parent.template, parent.centers, parent.weights
     c, q = len(template), len(centers)
     fixed, free = weights[:c], weights[c:]
@@ -126,21 +126,16 @@ def _proposals(model, geometry, parent, family, capacity, templates):
         return _Start(new_template, np.asarray(new_centers).reshape(-1, model.r), np.r_[new_fixed, new_free])
 
     if family == 'template':
-        for permitted in templates:
-            if permitted == template or q+bool(permitted) > capacity or not (q or permitted):
-                continue
-            retained = {term: weight for term, weight in zip(template, fixed)}
-            new_fixed = np.array([retained.get(term, min(.05, 1./(c+q+1))) for term in permitted])
-            yield start(centers, free, permitted, new_fixed)
+        if c and q:
+            yield start(centers, free, (), [])
+        elif not c and can_grow:
+            yield start(centers, free, ('C',), [min(.05, 1./(q+1))])
         return
     if family == 'promotion':
         nearest = np.argsort(np.sum((centers-1.)**2, axis=1), kind='stable')
-        permitted = tuple(term for term in ('U', 'V') if term in template or term == 'V')
         for i in nearest:
-            terms = {term: weight for term, weight in zip(template, fixed)}
-            terms['V'] = terms.get('V', 0.)+free[i]
             keep = np.arange(q) != i
-            yield start(centers[keep], free[keep], permitted, [terms[term] for term in permitted])
+            yield start(centers[keep], free[keep], ('C',), [free[i]+(fixed[0] if c else 0.)])
         return
 
     def merged(first, second):
@@ -178,10 +173,7 @@ def _proposals(model, geometry, parent, family, capacity, templates):
 
     if (family == 'split' and (not can_grow or not q)) or (family == 'split_merge' and q < 3) or (family == 'transfer' and q < 2):
         return
-    responsibility = parent.responsibilities
-    biological = (np.c_[responsibility[:, :c].sum(axis=1), responsibility[:, c:]]
-                  if c else responsibility)
-    labels = np.argmax(biological, axis=1)-bool(c)
+    labels = np.argmax(parent.responsibilities, axis=1)-c
     members = [np.flatnonzero(labels == i) for i in range(q)]
     if family == 'transfer':
         columns = model.log_columns((), centers)
@@ -235,8 +227,7 @@ def search(model, *, max_clusters, proposal_budget=32,
     if min(model.n, model.r) < 1:
         raise ValueError('Search needs at least one informative mutation and region')
     capacity = min(model.n, int(max_clusters))
-    # Use canonical V to represent the structurally identical single-copy pair.
-    templates = ((), ('V',)) if model.structural_uv_equal else ((), ('U',), ('V',), ('U', 'V'))
+    templates = ((), ('C',))
     geometry = _PilotGeometry(model)
     seen, failures, attempts, skipped = {}, [], Counter(), Counter()
     bank, accepted = {}, 0
@@ -307,8 +298,7 @@ def search(model, *, max_clusters, proposal_budget=32,
                   active_biological_count=fit.biological_count))
         return True, True, fit if advancing else None
 
-    # A free-count start is built once and evaluated under each eligible
-    # template. A two-term clonal template uses only one biological slot.
+    # A free-count start is built once and evaluated with and without C.
     coverage = {}
     for free_count, seeds in enumerate(geometry.seed_families(capacity)):
         for template in templates:
@@ -324,7 +314,7 @@ def search(model, *, max_clusters, proposal_budget=32,
 
     def schedule(parent):
         for family, queue in agenda.items():
-            queue.append((parent, _proposals(model, geometry, parent, family, capacity, templates)))
+            queue.append((parent, _proposals(model, geometry, parent, family, capacity)))
 
     # Round-robin by operator AND distinct parent. Improving offspring can
     # spawn more proposals; overrepresented K or operators cannot monopolize
@@ -355,8 +345,6 @@ def search(model, *, max_clusters, proposal_budget=32,
 
     return SearchResult(best, dict(requested_capacity=int(max_clusters), biological_capacity=capacity,
         templates=[list(template) for template in templates],
-        structural_uv_equivalence=bool(model.structural_uv_equal),
-        structurally_equivalent_templates_skipped=[['U'], ['U', 'V']] if model.structural_uv_equal else [],
         mandatory_attempts=attempts['farthest_point']+attempts['recursive_split'],
         covered_counts=sorted(covered), incomplete_counts=sorted(set(range(1, capacity+1))-covered),
         proposal_budget=int(proposal_budget),

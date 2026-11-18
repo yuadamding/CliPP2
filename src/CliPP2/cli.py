@@ -1,4 +1,4 @@
-"""One command for Protocol 3.0 CPU discovery and publication."""
+"""One command for fixed-multiplicity CPU clustering."""
 import argparse
 from pathlib import Path
 
@@ -8,7 +8,7 @@ from .config import DEFAULT_MAX_CLUSTERS, DEFAULT_MISSING_COUNTS, DEFAULT_PROPOS
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="clipp2", allow_abbrev=False,
-        description="Fit and publish one clonal/single-copy-free mixture.")
+        description="Estimate multiplicities from reads, then cluster mutations at fixed multiplicity.")
     parser.add_argument("--version", action="version", version=__version__)
     fit = parser.add_subparsers(dest="command", required=True).add_parser(
         "fit", allow_abbrev=False, help="Run one CPU fit.")
@@ -18,12 +18,9 @@ def build_parser():
     fit.add_argument("--output-dir", type=Path, required=True, help="New directory for results.")
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
                      help=f"Maximum biological clusters (default: {DEFAULT_MAX_CLUSTERS}).")
-    fit.add_argument("--max-major-cn", type=int, help="Optional major-CN cutoff.")
     fit.add_argument("--cpu-threads", type=int, help="Optional BLAS thread limit.")
     fit.add_argument("--proposal-budget", type=int, default=DEFAULT_PROPOSAL_BUDGET,
                      help=f"Optional search proposals (default: {DEFAULT_PROPOSAL_BUDGET}).")
-    fit.add_argument("--normal-cn-policy", choices=("diploid",),
-                     help="Assume diploid normal CN where it was not supplied.")
     fit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS,
                      help=f"Missing read-count policy (default: {DEFAULT_MISSING_COUNTS}).")
     return parser
@@ -38,9 +35,9 @@ def main(argv=None):
         parser.error(f"--input-file must name an existing file: {args.input_file}")
     try:
         config = FitConfig(
-            max_clusters=args.max_clusters, max_major_cn=args.max_major_cn,
-            cpu_threads=args.cpu_threads, proposal_budget=args.proposal_budget,
-            normal_cn_policy=args.normal_cn_policy, missing_counts=args.missing_counts,
+            max_clusters=args.max_clusters, cpu_threads=args.cpu_threads,
+            proposal_budget=args.proposal_budget,
+            missing_counts=args.missing_counts,
         )
     except ValueError as error:
         parser.error(str(error))

@@ -3,8 +3,10 @@
 from bisect import bisect_right
 from pathlib import Path
 
-from .cn_states import SegmentCNStates
-from .tumor_txt import TumorTxtError, _finite_float, _identifier, _provenance_flag, _read_text_table, _safe_tumor_id
+from .cn_states import single_cn_state
+from .tumor_txt import (
+    TumorTxtError, _check_normal_cn, _finite_float, _identifier, _provenance_flag, _read_text_table, _safe_tumor_id,
+)
 
 _FILES = ("snv.txt", "cna.txt", "purity.txt")
 _SNV_COLUMNS = ("chromosome_index", "position", "alt_count", "ref_count")
@@ -74,34 +76,29 @@ def _read_region(path):
         chrom = _identifier(row["chromosome_index"], name=f"{path} chromosome_index")
         start, end = (_integer(row[name], name=f"{path} {name}", minimum=1)
                       for name in ("start_position", "end_position"))
-        major, minor, total, normal = (_integer(row.get(name, "2"), name=f"{path} {name}")
-                                      for name in ("major_cn", "minor_cn", "total_cn", "normal_cn"))
+        major, minor, total = (_integer(row[name], name=f"{path} {name}") for name in ("major_cn", "minor_cn", "total_cn"))
+        _check_normal_cn(row, path)
         if start > end or major < minor or total != major + minor:
             raise TumorTxtError(f"{path}: invalid CNA interval {chrom}:{start}-{end}; require "
                                 "start <= end, major_cn >= minor_cn and total_cn = major_cn + minor_cn.")
-        supplied = _provenance_flag(row, ("normal_cn_supplied", "_normal_cn_supplied"),
-                                    "Normal-CN", default="normal_cn" in row)
-        if supplied and "normal_cn" not in row:
-            raise TumorTxtError(f"{path}: normal CN cannot be marked supplied without normal_cn.")
         genuine = _provenance_flag(row, ("mapping_genuine", "_mapping_genuine"), "Genuine-mapping")
-        groups.setdefault((chrom, start, end), []).append((normal, supplied, genuine, major, minor, row))
+        groups.setdefault((chrom, start, end), []).append((genuine, major, minor, row))
 
     intervals = {}
     for (chrom, start, end), group in groups.items():
         segment = f"{chrom}:{start}-{end}"
-        normal, supplied, genuine, major, minor, _ = group[0]
+        genuine, major, minor, _ = group[0]
         if len(group) > 1 and not explicit:
             raise TumorTxtError(f"{path}: duplicate CNA interval {segment}; multiple states require "
                                 "cn_state_id and cn_state_fraction.")
-        if any(row[:3] != group[0][:3] for row in group[1:]):
-            raise TumorTxtError(f"{path}: normal CN and provenance must agree across states of {segment}.")
-        states = None
+        if any(row[0] != genuine for row in group[1:]):
+            raise TumorTxtError(f"{path}: mapping flags disagree across states of {segment}.")
         if explicit:
-            states = SegmentCNStates(tuple((path.name, segment, row["cn_state_id"],
-                 row["cn_state_fraction"], a, b) for _, _, _, a, b, row in group)).records
-            # Preserve maximum representative CN, but a zero-fraction state is absent.
-            major, minor = max((a, b) for _, _, _, fraction, a, b in states if fraction > 0)
-        intervals.setdefault(chrom, []).append((start, end, segment, major, minor, normal, supplied, genuine, states))
+            major, minor = single_cn_state(
+                ((row["cn_state_id"], row["cn_state_fraction"], a, b) for _, a, b, row in group),
+                sample_id=path.name, segment_id=segment,
+            )
+        intervals.setdefault(chrom, []).append((start, end, segment, major, minor, genuine))
 
     indexed = {}
     for chrom, segments in intervals.items():
@@ -125,11 +122,10 @@ def read_region_directory(path: Path):
                 if idx < 0 or position > segments[idx][1]:
                     raise TumorTxtError(f"{path}: input_missing CN segment for mutation {chrom}:{position} "
                                         f"in sample {sample!r}; supply an inclusive covering CNA interval.")
-                _, _, segment, major, minor, normal, supplied, genuine, states = segments[idx]
+                _, _, segment, major, minor, genuine = segments[idx]
                 alt, ref, observed, excluded = observations.get((chrom, position), (None, None, False, False))
                 yield dict(mutation_id=f"{chrom}:{position}", sample_id=sample, alt_count=alt,
                            ref_count=ref, count_observed=observed, input_excluded=excluded, purity=purity,
-                           allele_a_cn=major, allele_b_cn=minor, normal_cn=normal, normal_cn_supplied=supplied,
-                           mapping_genuine=genuine, segment_id=segment, segment_cn_states=states)
+                           allele_a_cn=major, allele_b_cn=minor, mapping_genuine=genuine, segment_id=segment)
 
     return _safe_tumor_id(path.name), rows()

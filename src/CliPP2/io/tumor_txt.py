@@ -10,14 +10,14 @@ from typing import Any
 
 import numpy as np
 
-from ..config import DEFAULT_MAX_MAJOR_CN, DEFAULT_MISSING_COUNTS, validate_max_major_cn
+from ..config import DEFAULT_MISSING_COUNTS
 from .data import PURITY_MEAN_ATOL, TumorData
 from .read_counts import resolve_read_counts
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 SCHEMA_COLUMNS = (
     "mutation_id", "sample_id", "alt_count", "ref_count", "count_observed",
-    "purity", "normal_cn", "segment_id", "cn_state_id", "cn_state_fraction", "allele_a_cn", "allele_b_cn",
+    "purity", "segment_id", "cn_state_id", "cn_state_fraction", "allele_a_cn", "allele_b_cn",
 )
 
 
@@ -174,6 +174,11 @@ def _nonnegative_integer(
     return int(round(numeric))
 
 
+def _check_normal_cn(row, context):
+    if "normal_cn" in row and _finite_float(row["normal_cn"], name=f"{context} normal_cn") != 2:
+        raise TumorTxtError(f"{context} normal_cn is fixed at 2.")
+
+
 def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, Any]:
     context = f"row {row_number}"
     mutation_id = _identifier(row["mutation_id"], name=f"{context} mutation_id")
@@ -195,9 +200,7 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
     purity = _finite_float(row["purity"], name=f"{context} purity")
     if not 0.0 < purity <= 1.0:
         raise TumorTxtError(f"{context} purity must lie in (0, 1].")
-    normal_cn = _finite_float(row["normal_cn"], name=f"{context} normal_cn")
-    if normal_cn < 0.0 or normal_cn != np.rint(normal_cn):
-        raise TumorTxtError(f"{context} normal_cn must be a nonnegative integer.")
+    _check_normal_cn(row, context)
     fraction = _finite_float(
         row["cn_state_fraction"],
         name=f"{context} cn_state_fraction",
@@ -218,7 +221,9 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
     segment_id = _identifier(row["segment_id"], name=f"{context} segment_id")
     _identifier(row["cn_state_id"], name=f"{context} cn_state_id")
     from .cn_states import parse_segment_cn_states
-    states = parse_segment_cn_states(row.get("segment_cn_states"), sample_id=sample_id, segment_id=segment_id)
+    state = parse_segment_cn_states(row.get("segment_cn_states"), sample_id=sample_id, segment_id=segment_id)
+    if state is not None and state != (allele_a, allele_b):
+        raise TumorTxtError(f"{context} segment_cn_states active CN disagrees with the supplied CN pair.")
     return {
         "mutation_id": mutation_id,
         "sample_id": sample_id,
@@ -227,11 +232,8 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
         "count_observed": count_observed,
         "input_excluded": _provenance_flag(row, ("input_excluded",), "Input exclusion", default=False),
         "mapping_genuine": _provenance_flag(row, ("mapping_genuine", "_mapping_genuine"), "Genuine-mapping"),
-        "normal_cn_supplied": _provenance_flag(row, ("normal_cn_supplied", "_normal_cn_supplied"), "Normal-CN"),
         "purity": purity,
-        "normal_cn": normal_cn,
         "segment_id": segment_id,
-        "segment_cn_states": None if states is None else states.records,
         "allele_a_cn": allele_a,
         "allele_b_cn": allele_b,
     }
@@ -254,22 +256,19 @@ def _provenance_flag(row, names, description, *, default=True):
     return values[0] if values else default
 
 
-def _prepare(tumor_id, parsed, *, max_major_cn, missing_counts, normal_cn_policy):
-    rows, segments, purities, eligible_purity = {}, {}, {}, {}
+def _prepare(tumor_id, parsed, *, missing_counts):
+    rows, segments, purities = {}, {}, {}
     for row in parsed:
         mutation, region = row["mutation_id"], row["sample_id"]
         unit = mutation, region
         if unit in rows:
             raise TumorTxtError(f"One canonical observation is required per mutation/sample pair: {unit!r}.")
         segment = region, row["segment_id"]
-        specification = row["allele_a_cn"], row["allele_b_cn"], row["segment_cn_states"]
-        if segments.setdefault(segment, specification) != specification:
-            raise TumorTxtError(f"CN pair or state specification is inconsistent within region/segment {segment!r}.")
+        pair = row["allele_a_cn"], row["allele_b_cn"]
+        if segments.setdefault(segment, pair) != pair:
+            raise TumorTxtError(f"CN pair is inconsistent within region/segment {segment!r}.")
         rho = row["purity"]
         purities.setdefault(region, []).append(rho)
-        row["input_excluded"] |= max_major_cn is not None and row["allele_a_cn"] > max_major_cn
-        if not row["input_excluded"]:
-            eligible_purity[region] = min(eligible_purity.get(region, rho), rho)
         rows[unit] = row
 
     mutations = tuple(sorted({mutation for mutation, _ in rows}))
@@ -300,21 +299,18 @@ def _prepare(tumor_id, parsed, *, max_major_cn, missing_counts, normal_cn_policy
     return TumorData(
         tumor_id=tumor_id, mutation_ids=mutations, region_ids=regions,
         alt_counts=column("alt_count"), total_counts=column("depth"),
-        purity=np.broadcast_to([eligible_purity[r] if r in eligible_purity else min(purities[r]) for r in regions],
-                               (len(mutations), len(regions))),
-        major_cn=column("allele_a_cn"), minor_cn=column("allele_b_cn"), normal_cn=column("normal_cn"),
+        purity=np.broadcast_to([min(purities[r]) for r in regions], (len(mutations), len(regions))),
+        major_cn=column("allele_a_cn"), minor_cn=column("allele_b_cn"),
         count_observed=column("count_observed", bool), count_imputed=column("count_imputed", bool),
-        normal_cn_supplied=column("normal_cn_supplied", bool), mapping_genuine=column("mapping_genuine", bool),
-        input_excluded=column("input_excluded", bool), normal_cn_policy=normal_cn_policy, read_count_report=report,
+        mapping_genuine=column("mapping_genuine", bool), input_excluded=column("input_excluded", bool),
+        read_count_report=report,
     )
 
 
-def load_tumor_txt(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
-                   normal_cn_policy=None, missing_counts=DEFAULT_MISSING_COUNTS) -> TumorData:
+def load_tumor_txt(path: str | Path, *, missing_counts=DEFAULT_MISSING_COUNTS) -> TumorData:
     """Validate one full input population and resolve eligible missing reads."""
     from .region_files import read_region_directory
 
-    max_major_cn = validate_max_major_cn(max_major_cn)
     path = Path(path).resolve()
     if path.is_dir():
         tumor_id, rows = read_region_directory(path)
@@ -322,5 +318,4 @@ def load_tumor_txt(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_M
         metadata, _, source = _read_text_table(path)
         tumor_id = metadata["tumor_id"]
         rows = (_normalize_row(row, row_number=n) for n, row in enumerate(source, 1))
-    return _prepare(tumor_id, rows, max_major_cn=max_major_cn, missing_counts=missing_counts,
-                    normal_cn_policy=normal_cn_policy)
+    return _prepare(tumor_id, rows, missing_counts=missing_counts)

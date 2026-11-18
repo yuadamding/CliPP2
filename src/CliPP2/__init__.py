@@ -1,4 +1,4 @@
-"""CliPP2: one biological clonal and single-copy-free mixture model."""
+"""CliPP2: joint regional CCF clustering at fixed preprocessing multiplicity."""
 
 from __future__ import annotations
 

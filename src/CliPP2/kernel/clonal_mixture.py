@@ -1,4 +1,4 @@
-"""Role-aware soft mixture on the CPU; no hard-partition fitting or native forest."""
+"""Joint CCF mixture conditional on fixed mutation–region multiplicities."""
 from dataclasses import dataclass
 import math
 
@@ -16,7 +16,7 @@ class MixtureConvergenceError(RuntimeError):
 
 @dataclass(frozen=True)
 class ClonalFit:
-    """Active terms: the fixed clonal subset, then the distinct free centers."""
+    """Active terms: the optional clonal component, then distinct free centers."""
 
     template: tuple
     centers: np.ndarray
@@ -41,7 +41,7 @@ class ClonalFit:
         return self.centers.size + len(self.weights) - 1
 
 
-def _single_copy_coordinate(alt_mass, slopes, ref_mass):
+def _fixed_multiplicity_coordinate(alt_mass, slopes, ref_mass):
     """Exact scalar optimum by the bracketed monotone binomial score."""
     if not alt_mass:
         return 0.
@@ -64,49 +64,8 @@ def _single_copy_coordinate(alt_mass, slopes, ref_mass):
     return float(brentq(score, 0., 1., xtol=1e-15))
 
 
-def binomial_log_mass(constant, alt, ref, probability):
-    """Log binomial mass, including exact endpoint probabilities."""
-    p = np.minimum(1., probability)
-    return constant + xlogy(alt, p) + xlog1py(ref, -p)
-
-
-def _log_support_count(minimum, region_count, above_minimum):
-    """Log of (minimum - 1) * (2**region_count - 1) + 2**above_minimum."""
-    lower = np.log(minimum - 1, out=np.full_like(minimum, -np.inf, dtype=float), where=minimum > 1)
-    return np.logaddexp(lower + region_count*math.log(2.) + np.log1p(-np.exp2(-region_count.astype(float))),
-                        above_minimum*math.log(2.))
-
-
-def _clonal_uniform(model):
-    """Log-domain range-one DP by the unique minimum of an admissible vector."""
-    mask = model.observed
-    major = model.major
-    cap = np.where(mask, major, np.iinfo(np.int64).max).min(axis=1)
-    partition = np.full(model.n, -np.inf)
-    for anchor in range(1, int(cap.max()) + 1):
-        rows = np.flatnonzero(cap >= anchor)
-        no_min = np.zeros(len(rows))
-        has_min = np.full(len(rows), -np.inf)
-        for r in range(model.r):
-            used = mask[rows, r]
-            if not used.any():
-                continue
-            idx = rows[used]
-            a = model.alt[idx, r]
-            b = model.ref[idx, r]
-            allow_hi = major[idx, r] > anchor
-            slope = model.scaling[idx, r]
-            constant = model.constants[idx, r]
-            x = binomial_log_mass(constant, a, b, slope * anchor)
-            y = np.where(allow_hi, binomial_log_mass(constant, a, b, slope * (anchor + 1)), -np.inf)
-            has_min[used] = np.logaddexp(has_min[used] + np.logaddexp(x, y), no_min[used] + x)
-            no_min[used] += y
-        partition[rows] = np.logaddexp(partition[rows], has_min)
-    return partition - _log_support_count(cap, mask.sum(axis=1), (mask & (major > cap[:, None])).sum(axis=1))
-
-
 class ClonalModel:
-    """One prepared population, with fixed clonal columns and single-copy pilots."""
+    """Prepare shared fixed-dose likelihood slopes, clonal emissions and CCF pilots."""
 
     def __init__(self, data):
         if not isinstance(data, TumorData):
@@ -131,20 +90,16 @@ class ClonalModel:
         self.alt = readonly_array(np.where(self.observed, data.alt_counts[ix], 0.))
         self.depth = readonly_array(np.where(self.observed, data.total_counts[ix], 0.))
         self.ref = readonly_array(self.depth - self.alt)
-        self.major = readonly_array(data.major_cn[ix], dtype=np.int64)
+        self.fixed_multiplicity = readonly_array(data.fixed_multiplicity[ix])
         purity = data.purity[ix]
-        denominator = (1.-purity)*data.normal_cn[ix] + purity*data.total_cn[ix]
-        # Keep the old neutral numerical slope and reduction grouping for
-        # excluded pairs without replacing any supplied CN in TumorData.
-        denominator = np.where(self.excluded, (1.-purity)*2. + purity*2., denominator)
-        if not np.isfinite(denominator).all() or np.any(denominator <= 0):
-            raise ValueError("Normal-plus-tumor denominator must be finite and positive")
-        self.scaling = readonly_array(purity / denominator)
+        denominator = purity*data.total_cn[ix] + 2.*(1.-purity)
+        # Imputed zero ALT is fitting evidence at internal dose one, never a
+        # public multiplicity call. All other uninformative entries are inert.
+        dose = np.where(self.measured, self.fixed_multiplicity, data.count_imputed[ix])
+        self.scaling = readonly_array(purity*dose / denominator)
         self.constants = readonly_array(
             gammaln(self.depth + 1.) - gammaln(self.alt + 1.) - gammaln(self.ref + 1.))
-        self.log_v = readonly_array(self.regional_columns(np.ones(self.r)).sum(axis=1))
-        self.structural_uv_equal = bool(np.all(self.major[self.observed] == 1))
-        self.log_u = self.log_v if self.structural_uv_equal else readonly_array(_clonal_uniform(self))
+        self.log_clonal = readonly_array(self.regional_columns(np.ones(self.r)).sum(axis=1))
         self._slopes = tuple(np.unique(self.scaling[:, r], return_inverse=True) for r in range(self.r))
         pilots = np.full_like(self.alt, np.nan)
         np.divide(self.alt, self.depth * self.scaling, out=pilots, where=self.observed)
@@ -158,13 +113,14 @@ class ClonalModel:
         ref_mass = np.bincount(inverse, weights=posterior*self.ref[:, region], minlength=len(slopes))
         if not alt and not np.any(ref_mass):
             return float(fallback)
-        return _single_copy_coordinate(alt, slopes, ref_mass)
+        return _fixed_multiplicity_coordinate(alt, slopes, ref_mass)
 
     def regional_columns(self, center):
-        return binomial_log_mass(self.constants, self.alt, self.ref, self.scaling * center)
+        p = np.minimum(1., self.scaling * center)
+        return self.constants + xlogy(self.alt, p) + xlog1py(self.ref, -p)
 
     def log_columns(self, template, centers):
-        columns = [self.log_u if kind == "U" else self.log_v for kind in _template(template)]
+        columns = [self.log_clonal] if _template(template) else []
         columns.extend(self.regional_columns(center).sum(axis=1) for center in centers)
         if not columns:
             raise ValueError("A mixture needs at least one component")
@@ -173,27 +129,25 @@ class ClonalModel:
 
 def _template(template):
     template = tuple(template)
-    if template not in ((), ("U",), ("V",), ("U", "V")):
-        raise ValueError("Expected a canonical clonal template (), (U), (V), or (U,V)")
+    if template not in ((), ("C",)):
+        raise ValueError("Expected clonal template () or ('C',)")
     return template
 
 
 def _canonical(model, template, centers, weights, *, promote):
-    fixed, free = {}, {}
-    for i, kind in enumerate(template):
-        key = "V" if model.structural_uv_equal else kind
-        fixed[key] = fixed.get(key, 0.) + weights[i]
+    clonal = weights[0] if template else None
+    free = {}
     for center, w in zip(centers, weights[len(template):]):
         if promote and np.all(center == 1.):
-            fixed["V"] = fixed.get("V", 0.) + w
+            clonal = w if clonal is None else clonal + w
         else:
             key = tuple(center)
             free[key] = free.get(key, 0.) + w
-    template = tuple(sorted(fixed))
-    # Lexicographic sorting gives stable digest keys across equivalent starts.
+    template = () if clonal is None else ("C",)
+    # Lexicographic sorting gives stable keys across equivalent starts.
     ordered = sorted(free)
     centers = np.asarray(ordered).reshape(-1, model.r)
-    weights = np.array([fixed[key] for key in template] + [free[key] for key in ordered])
+    weights = np.array(([clonal] if template else []) + [free[key] for key in ordered])
     return template, centers, weights / weights.sum()
 
 

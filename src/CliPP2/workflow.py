@@ -1,4 +1,4 @@
-"""Prepare one CPU mixture, select a fit, and publish biological assignments."""
+"""Freeze preprocessing multiplicities, fit CCFs, and publish assignments."""
 
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -38,8 +38,7 @@ def run_workflow(input_path, outdir, config=FitConfig(), *, progress_callback=No
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"Output already exists; choose a new directory: {output}")
 
-    data = load_tumor_txt(input_path, max_major_cn=config.max_major_cn,
-                         missing_counts=config.missing_counts, normal_cn_policy=config.normal_cn_policy)
+    data = load_tumor_txt(input_path, missing_counts=config.missing_counts)
     limits = nullcontext() if config.cpu_threads is None else threadpool_limits(config.cpu_threads, user_api="blas")
     with limits:
         model = ClonalModel(data)
