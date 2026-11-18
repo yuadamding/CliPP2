@@ -1,13 +1,11 @@
 """Independently validate a selected Protocol 3.0 fit before publication."""
 
-import numpy as np
-
 from .config import MODEL_ID, PROTOCOL_VERSION
 from .io.clonal_reporting import OUTPUT_SCHEMA, evaluate_fit, publish_stage
 from .io.data import content_hash
 
 
-def stage_record(model, fit, result, catalog, stage):
+def stage_record(model, fit, result, catalog):
     certificate = {
         name: fit.diagnostics[name]
         for name in (
@@ -25,7 +23,7 @@ def stage_record(model, fit, result, catalog, stage):
         protocol_version=PROTOCOL_VERSION,
         model=MODEL_ID,
         output_schema=OUTPUT_SCHEMA,
-        stage=stage,
+        stage="stage_one",
         tumor_id=catalog.tumor_id,
         catalog_content_hash=catalog.content_hash,
         mutation_ids=model.mutation_ids,
@@ -54,20 +52,8 @@ def stage_record(model, fit, result, catalog, stage):
     }
 
 
-def publish_selected(model, fit, catalog, outdir, stage, *, selected_from=None):
+def publish_selected(model, fit, catalog, outdir):
     result = evaluate_fit(model, fit, catalog=catalog)
-    record = stage_record(model, fit, result, catalog, stage)
-    if selected_from is not None:
-        prior_assignment, prior_record = selected_from
-        if record["state_identity"] != prior_record[
-            "state_identity"
-        ] or not np.array_equal(
-            result.responsibilities, prior_assignment.responsibilities
-        ):
-            raise ValueError(
-                "Final biological assignments differ from the accepted Stage 2 model."
-            )
-    tables = publish_stage(
-        model, fit, result, outdir, include_probabilities=selected_from is not None
-    )
+    record = stage_record(model, fit, result, catalog)
+    tables = publish_stage(model, fit, result, outdir)
     return result, record, tables

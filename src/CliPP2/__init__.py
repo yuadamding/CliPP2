@@ -11,7 +11,6 @@ _EXPORTS = {
     "TumorData": ".io.data",
     "load_tumor_txt": ".io.tumor_txt",
     "WorkflowConfig": ".config",
-    "MultiplicityBounds": ".io.data",
     "OriginalCatalog": ".io.data",
     "load_original_catalog": ".io.tumor_txt",
     "run_workflow": ".workflow",

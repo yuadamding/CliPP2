@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .data import CNFilterRecord, CNFilterReport, TumorData, OriginalCatalog, MultiplicityBounds, _indices, PURITY_MEAN_ATOL
+from .data import CNFilterRecord, CNFilterReport, TumorData, OriginalCatalog, _indices, PURITY_MEAN_ATOL
 from ..config import DEFAULT_MAX_MAJOR_CN, DEFAULT_MISSING_COUNTS, validate_max_major_cn, validate_missing_counts
 from .read_counts import resolve_read_counts
 
@@ -535,7 +535,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, missing
         **numeric)
 
 
-def _catalog_data(catalog, mutation_ids, *, prediction, normal_cn_policy=None):
+def _catalog_data(catalog, mutation_ids, *, normal_cn_policy=None):
     """Compile selected frozen observations without changing the original population."""
     from .data import validate_workflow_mapping
     mutations, rows = _indices(mutation_ids, catalog.mutation_ids, "mutation")
@@ -546,12 +546,11 @@ def _catalog_data(catalog, mutation_ids, *, prediction, normal_cn_policy=None):
     records = tuple(CNFilterRecord(mutation, region, str(catalog.segment_ids[i, j]),
         INPUT_EXCLUDED if catalog.input_excluded[i, j] else MAJOR_CN_ABOVE_LIMIT, int(catalog.major_cn[i, j]))
         for i, mutation in zip(rows, mutations) for j, region in enumerate(catalog.region_ids) if not catalog.eligible[i, j])
-    if not prediction:
-        mutations = tuple(m for m, keep in zip(mutations, eligible_rows) if keep)
-        rows = rows[eligible_rows]
+    mutations = tuple(m for m, keep in zip(mutations, eligible_rows) if keep)
+    rows = rows[eligible_rows]
     policy = _filter_policy(catalog.max_major_cn, records)
     report = CNFilterReport(policy, catalog.max_major_cn, input_count, int(eligible_rows.sum()), excluded, records)
-    if not prediction and not mutations:
+    if not mutations:
         raise NoEligibleSNVsError(report, tumor_id=catalog.tumor_id)
     use = catalog.eligible[rows]
     observed = use & catalog.count_observed[rows]
@@ -563,34 +562,6 @@ def _catalog_data(catalog, mutation_ids, *, prediction, normal_cn_policy=None):
         cn_filter_report=report, original_catalog=catalog, normal_cn_supplied=catalog.normal_cn_supplied[rows],
         input_excluded=catalog.input_excluded[rows], mapping_genuine=catalog.mapping_genuine[rows],
         normal_cn_policy=normal_cn_policy)
-
-
-def load_multiplicity_bounds(path: str | Path, catalog_or_data) -> MultiplicityBounds:
-    """Read exactly one endpoint row for every supplied mutation–region key."""
-    columns = ("mutation_id", "sample_id", "multiplicity_lower", "multiplicity_upper")
-    _, table = _read_text_table(Path(path), columns=columns, canonical=False)
-    mutations, regions = tuple(catalog_or_data.mutation_ids), tuple(catalog_or_data.region_ids)
-    lookup = {}
-    for row in table.to_dict(orient="records"):
-        key = (_identifier(row["mutation_id"], name="mutation_id"),
-               _identifier(row["sample_id"], name="sample_id"))
-        if key in lookup:
-            raise TumorTxtError(f"Duplicate multiplicity-bound key: {key}")
-        endpoints = []
-        for name in ("multiplicity_lower", "multiplicity_upper"):
-            value = row[name]
-            if not value.isascii() or not value.isdecimal() or int(value) < 1 or int(value) >= 2**63:
-                raise TumorTxtError(f"{name} must be a positive int64 integer")
-            endpoints.append(int(value))
-        lookup[key] = endpoints
-    expected = {(mutation, region) for mutation in mutations for region in regions}
-    if set(lookup) != expected:
-        raise TumorTxtError("Multiplicity bounds must cover exactly every supplied original mutation-region key")
-    lower = np.array([[lookup[m, r][0] for r in regions] for m in mutations], dtype=np.int64)
-    upper = np.array([[lookup[m, r][1] for r in regions] for m in mutations], dtype=np.int64)
-    bounds = MultiplicityBounds(mutations, regions, lower, upper)
-    bounds.for_data(catalog_or_data)
-    return bounds
 
 
 def _canonical_text_value(value: object) -> str:
@@ -691,6 +662,5 @@ __all__ = [
     "load_tumor_txt",
     "load_original_catalog",
     "audit_input",
-    "load_multiplicity_bounds",
     "write_tumor_txt",
 ]

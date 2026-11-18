@@ -175,101 +175,6 @@ def _indices(requested, available, name):
     return requested, np.asarray([lookup[value] for value in requested], dtype=int)
 
 
-@dataclass(frozen=True, slots=True)
-class MultiplicityBounds(ImmutableArrayRecord):
-    """Keyed integer support endpoints; these never replace biological CN."""
-
-    mutation_ids: tuple[str, ...]
-    region_ids: tuple[str, ...]
-    lower: np.ndarray
-    upper: np.ndarray
-    policy_id: str = "explicit"
-    _content_hash: str = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self):
-        for name in ("mutation_ids", "region_ids"):
-            values = tuple(getattr(self, name))
-            if len(set(values)) != len(values) or any(not isinstance(x, str) or not x for x in values):
-                raise ValueError(f"{name} must contain unique nonempty strings")
-            object.__setattr__(self, name, values)
-        if not isinstance(self.policy_id, str) or not self.policy_id:
-            raise ValueError("Multiplicity bounds require a nonempty policy identity")
-        shape = (len(self.mutation_ids), len(self.region_ids))
-        for name in ("lower", "upper"):
-            values = np.asarray(getattr(self, name))
-            if not values.size:
-                values = values.reshape(shape)
-            if (values.shape != shape or values.dtype.kind not in "iuf"
-                    or not np.isfinite(values).all() or np.any(values != np.rint(values))
-                    or np.any(values < 1) or np.any(values >= 2**63)):
-                raise ValueError("Multiplicity bounds must be aligned positive int64 integers")
-            object.__setattr__(self, name, readonly_array(values, dtype=np.int64))
-        if np.any(self.lower > self.upper):
-            raise ValueError("Multiplicity lower endpoints may not exceed upper endpoints")
-        object.__setattr__(self, "_content_hash", self._fingerprint())
-
-    def _fingerprint(self):
-        digest = hashlib.sha256(b"clipp2.multiplicity-bounds.v1\0")
-        digest.update(json.dumps([self.mutation_ids, self.region_ids, self.policy_id],
-                                 ensure_ascii=False, separators=(",", ":")).encode())
-        digest.update(self.lower.astype("<i8", copy=False).tobytes())
-        digest.update(self.upper.astype("<i8", copy=False).tobytes())
-        return digest.hexdigest()
-
-    @property
-    def content_hash(self):
-        return self._content_hash
-
-    def subset(self, mutation_ids, region_ids=None):
-        mutations, rows = _indices(mutation_ids, self.mutation_ids, "mutation")
-        regions, cols = _indices(self.region_ids if region_ids is None else region_ids,
-                                self.region_ids, "region")
-        ix = np.ix_(rows, cols)
-        return type(self)(mutations, regions, self.lower[ix], self.upper[ix], self.policy_id)
-
-    def for_data(self, data):
-        """Validate original support, then return aligned numerical endpoints.
-
-        Original excluded pairs stay excluded and receive inert [1,1] support.
-        Their biological CN and requested endpoints remain in the catalog/record.
-        """
-        if not isinstance(data, (TumorData, OriginalCatalog)):
-            raise TypeError("Multiplicity bounds require validated TumorData or OriginalCatalog")
-        aligned = self.subset(data.mutation_ids, data.region_ids)
-        catalog = data if isinstance(data, OriginalCatalog) else data.original_catalog
-        if catalog is None:
-            major = np.asarray(data.major_cn)
-            eligible = ~np.asarray(data.input_excluded, dtype=bool)
-            report = data.cn_filter_report
-            if report is not None and report.records:
-                # Placeholder CN cannot establish original support eligibility.
-                raise ValueError("Bounded excluded inputs require their original catalog")
-        else:
-            _, rows = _indices(data.mutation_ids, catalog.mutation_ids, "mutation")
-            _, cols = _indices(data.region_ids, catalog.region_ids, "region")
-            ix = np.ix_(rows, cols)
-            major, eligible = catalog.major_cn[ix], catalog.eligible[ix]
-        if np.any(aligned.upper > major):
-            raise ValueError("Multiplicity upper endpoints exceed original major CN")
-        return (readonly_array(np.where(eligible, aligned.lower, 1), dtype=np.int64),
-                readonly_array(np.where(eligible, aligned.upper, 1), dtype=np.int64))
-
-    def to_dict(self):
-        return {"schema": "clipp2.multiplicity-bounds.v1", "mutation_ids": list(self.mutation_ids),
-                "region_ids": list(self.region_ids), "lower": self.lower.tolist(),
-                "upper": self.upper.tolist(), "policy_id": self.policy_id,
-                "content_hash": self.content_hash}
-
-    @classmethod
-    def from_dict(cls, payload):
-        if payload.get("schema") != "clipp2.multiplicity-bounds.v1":
-            raise ValueError("Unsupported multiplicity-bounds schema")
-        value = cls(*(payload[name] for name in ("mutation_ids", "region_ids", "lower", "upper", "policy_id")))
-        if payload.get("content_hash") != value.content_hash:
-            raise ValueError("Multiplicity-bounds content hash mismatch")
-        return value
-
-
 _CATALOG_ARRAYS = ("alt_counts", "total_counts", "count_observed", "eligible", "major_cn",
                    "minor_cn", "normal_cn", "purity",
                    "segment_ids", "mapping_genuine", "normal_cn_supplied", "input_excluded")
@@ -476,11 +381,8 @@ class OriginalCatalog(ImmutableArrayRecord):
 
     def fit_data(self, mutation_ids=None, *, normal_cn_policy=None):
         from .tumor_txt import _catalog_data
-        return _catalog_data(self, self.mutation_ids if mutation_ids is None else mutation_ids, prediction=False, normal_cn_policy=normal_cn_policy)
-
-    def prediction_data(self, mutation_ids, *, normal_cn_policy=None):
-        from .tumor_txt import _catalog_data
-        return _catalog_data(self, mutation_ids, prediction=True, normal_cn_policy=normal_cn_policy)
+        return _catalog_data(self, self.mutation_ids if mutation_ids is None else mutation_ids,
+                             normal_cn_policy=normal_cn_policy)
 
     def subset(self, mutation_ids, region_ids=None):
         """Select keys in requested order without re-canonicalizing purity."""
@@ -498,11 +400,6 @@ class OriginalCatalog(ImmutableArrayRecord):
                       read_count_imputations=tuple(record for record in self.read_count_imputations
                           if record[0] in mutation_set and record[1] in region_set))
         return type(self)(**values)
-
-    def default_bounds(self):
-        upper = self.major_cn
-        return MultiplicityBounds(self.mutation_ids, self.region_ids, np.ones_like(upper), upper, "original")
-
 
 def validate_workflow_mapping(catalog, mutation_ids=None, *, normal_cn_policy=None):
     """Require genuine single-state CN wherever a strict workflow uses evidence.
@@ -531,5 +428,5 @@ def validate_workflow_mapping(catalog, mutation_ids=None, *, normal_cn_policy=No
                          f"normal_cn_policy='diploid'; invalid mutation-region mappings: {examples}")
 
 
-__all__ = ["CNFilterRecord", "CNFilterReport", "TumorData", "OriginalCatalog", "MultiplicityBounds",
+__all__ = ["CNFilterRecord", "CNFilterReport", "TumorData", "OriginalCatalog",
            "freeze_record", "thaw_record", "json_value", "content_hash", "validate_workflow_mapping"]

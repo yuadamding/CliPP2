@@ -1,4 +1,4 @@
-"""Deterministic discovery and bounded refinement for the single-copy mixture."""
+"""Deterministic starts and bounded discovery for the single-copy mixture."""
 from collections import Counter, deque
 from dataclasses import dataclass
 from itertools import combinations
@@ -118,18 +118,6 @@ def _key(template, centers, weights):
                          for row, w in zip(centers, weights[len(template):]))))
 
 
-def _verify_incumbent(model, fit):
-    """Refinement may only compete against the same population and objective."""
-    joint = model.log_columns(fit.template, fit.centers)+np.log(fit.weights)
-    rows = logsumexp(joint, axis=1)
-    score = -2.*rows.sum()+(fit.centers.size+len(fit.weights)-1)*np.log(model.n)
-    if (fit.responsibilities.shape != joint.shape
-            or not np.isclose(score, fit.bic, atol=1e-8, rtol=1e-12)
-            or not np.isclose(rows.sum(), fit.log_likelihood, atol=1e-8, rtol=1e-12)
-            or not np.allclose(np.exp(joint-rows[:, None]), fit.responsibilities, atol=1e-10, rtol=1e-10)):
-        raise ValueError('Stage 1 incumbent does not reproduce on the Stage 2 observations')
-
-
 def _proposals(model, geometry, parent, family, capacity, templates):
     template, centers, weights = parent.template, parent.centers, parent.weights
     c, q = len(template), len(centers)
@@ -238,15 +226,9 @@ def _proposals(model, geometry, parent, family, capacity, templates):
                 yield start(combined[keep], combined_mass[keep])
 
 
-def search(model, *, max_clusters, proposal_budget=32, incumbent=None, covered_counts=(),
+def search(model, *, max_clusters, proposal_budget=32,
            progress_callback=None, comparison_seeds=(), max_iterations=2000, gradient_tolerance=1e-5):
-    """Cover every biological count before bounded optional refinement.
-
-    The initial search need not have used this capacity: Stage 2 can carry an
-    incumbent and verified count coverage, preserving its exact BIC even when
-    subsequent attempts fail. Comparison seeds are opt-in external A results,
-    not another production estimator. All candidate ordering uses BIC.
-    """
+    """Try every biological count before bounded optional proposals."""
     if (isinstance(max_clusters, bool) or not isinstance(max_clusters, Integral) or max_clusters < 1
             or isinstance(proposal_budget, bool) or not isinstance(proposal_budget, Integral) or proposal_budget < 0):
         raise ValueError('Search requires a positive cluster capacity and a nonnegative proposal budget')
@@ -255,20 +237,12 @@ def search(model, *, max_clusters, proposal_budget=32, incumbent=None, covered_c
     if min(model.n, model.r) < 1:
         raise ValueError('Search needs at least one informative mutation and region')
     capacity = min(model.n, int(max_clusters))
-    covered_counts = tuple(covered_counts)
-    if any(isinstance(k, bool) or not isinstance(k, Integral) or not 1 <= k <= capacity for k in covered_counts):
-        raise ValueError('Covered counts must be integers within the biological capacity')
-    covered = set(map(int, covered_counts))
-    if covered and incumbent is None:
-        raise ValueError('Covered counts require their Stage 1 incumbent')
-    if incumbent is not None and incumbent.biological_count > capacity:
-        raise ValueError('Stage 2 biological capacity cannot exclude its Stage 1 incumbent')
     # Use canonical V to represent the structurally identical single-copy pair.
     templates = ((), ('V',)) if model.structural_uv_equal else ((), ('U',), ('V',), ('U', 'V'))
     geometry = _PilotGeometry(model)
     seen, records, attempts, skipped = {}, [], Counter(), Counter()
     bank, accepted = {}, 0
-    best = incumbent
+    best = None
     families = ('birth', 'split', 'merge', 'transfer', 'split_merge', 'template', 'promotion')
     agenda = {name: deque() for name in families}
 
@@ -278,7 +252,7 @@ def search(model, *, max_clusters, proposal_budget=32, incumbent=None, covered_c
     def rank(fit):
         return fit.bic, fit_key(fit)
 
-    def account(fit, *, preserve=False):
+    def account(fit):
         nonlocal best, accepted
         if fit.biological_count > capacity or not np.isfinite(fit.bic):
             raise ValueError('Numerically accepted state exceeds the search contract')
@@ -288,7 +262,7 @@ def search(model, *, max_clusters, proposal_budget=32, incumbent=None, covered_c
         # Compact frontier: keep the best state per structural stratum. The
         # BIC of every qualified fit was compared before retaining the frontier.
         stratum = (fit.biological_count, fit.template)
-        if preserve or stratum not in bank or rank(fit) < rank(bank[stratum]):
+        if stratum not in bank or rank(fit) < rank(bank[stratum]):
             bank[stratum] = fit
             return True
         return False
@@ -335,14 +309,9 @@ def search(model, *, max_clusters, proposal_budget=32, incumbent=None, covered_c
         emit(records[-1])
         return True, True, fit if advancing else None
 
-    if incumbent is not None:
-        _verify_incumbent(model, incumbent)
-        account(incumbent, preserve=True)
-        admit(_Start(incumbent.template, incumbent.centers, incumbent.weights), 'incumbent_warm_start', 'warm_start')
-
     # A free-count start is built once and evaluated under each eligible
     # template. A two-term clonal template uses only one biological slot.
-    coverage = {k: [] for k in range(1, capacity+1) if k not in covered}
+    coverage = {k: [] for k in range(1, capacity+1)}
     for free_count, seeds in enumerate(geometry.seed_families(capacity)):
         for template in templates:
             biological = free_count+bool(template)
@@ -351,7 +320,7 @@ def search(model, *, max_clusters, proposal_budget=32, incumbent=None, covered_c
             for family, centers in zip(('farthest_point', 'recursive_split'), seeds):
                 result, _, _ = admit(_Start(template, centers), family, 'mandatory', bio_count=biological)
                 coverage[biological].append(result)
-    covered.update(k for k, ok in coverage.items() if ok and all(ok))
+    covered = {k for k, ok in coverage.items() if ok and all(ok)}
     for seed in comparison_seeds:
         cert = _Start(tuple(getattr(seed, 'template', ())), np.asarray(getattr(seed, 'centers', seed)),
                       getattr(seed, 'weights', None))
@@ -393,17 +362,14 @@ def search(model, *, max_clusters, proposal_budget=32, incumbent=None, covered_c
                         schedule(result)
                     break
 
-    if incumbent is not None and best.bic > incumbent.bic:
-        raise AssertionError('Stage 2 lost the Stage 1 BIC incumbent')
     return SearchResult(best, dict(requested_capacity=int(max_clusters), biological_capacity=capacity,
         templates=[list(template) for template in templates],
         structural_uv_equivalence=bool(model.structural_uv_equal),
         structurally_equivalent_templates_skipped=[['U'], ['U', 'V']] if model.structural_uv_equal else [],
         mandatory_attempts=attempts['farthest_point']+attempts['recursive_split'],
         covered_counts=sorted(covered), incomplete_counts=sorted(set(range(1, capacity+1))-covered),
-        inherited_covered_counts=list(covered_counts), proposal_budget=int(proposal_budget),
+        proposal_budget=int(proposal_budget),
         proposal_attempts=proposal_attempts, attempts_by_family=dict(attempts), duplicates_by_family=dict(skipped),
-        qualified_attempts=accepted-int(incumbent is not None), frontier_strata=len(bank), attempts=records,
-        incumbent_bic=None if incumbent is None else float(incumbent.bic),
+        qualified_attempts=accepted, frontier_strata=len(bank), attempts=records,
         selected_bic=float(best.bic), selected_biological_count=best.biological_count,
         exhaustive_search=False, global_optimality_claimed=False))

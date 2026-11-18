@@ -1,58 +1,75 @@
 # CliPP2
 
-CliPP2 estimates mutation clusters and regional cancer cell fractions (CCFs)
-jointly across tumor regions. **Protocol 3.0** fits one mixture: an optional
-clonal class fixed at `(1,1,…)` and free-CCF classes with **multiplicity 1**
-in every informative region. Clonal multiplicity may be higher, subject to
-the original major-CN bounds and a cross-region range of at most one.
+CliPP2 clusters mutations jointly across one or more tumor regions and estimates
+regional cancer cell fractions (CCFs) and mutation multiplicities.
 
-## Install and run
+## Install
 
-Requires Python 3.10+ and a CPU. No CUDA, PyTorch or compiler is required.
+Requires Python 3.10+. From the repository root:
 
-```sh
+```bash
 python -m pip install .
-clipp2 workflow --plan examples/plan.json --output-dir results/example
 ```
 
-Use a new output directory. Stage 1 discovers the mixture from deterministic
-single-copy starts; Stage 2 refines the **same mutations and likelihood** and
-retains the Stage 1 fit if no candidate improves its BIC. Stage 3 publishes
-fitted biological probabilities and multiplicities without refitting.
-The default biological cluster capacities are **10 → 20**. There are no read
-floors, donor caps, or automatic near-clonal merges.
+This CPU implementation needs no C++ compiler, CUDA, or PyTorch.
 
-See the [example](examples/README.md) for the v8 JSON plan and the
-[scientific protocol](docs/workflow_protocol_3_0.md) for formulas, search
-limits, and output details. Version 2.5 plans and fits are not replayable.
+## Run
+
+```bash
+clipp2 fit --input-dir tumor/ --device cpu --output-dir results/
+```
 
 ## Input
 
-Provide either a tumor directory with one `snv.txt`, `cna.txt`, and
-`purity.txt` per region, or a canonical tumor TSV (gzip supported) with
-`mutation_id`, `sample_id`, `alt_count`, `ref_count`, `count_observed`,
-`purity`, `normal_cn`, `segment_id`, `cn_state_id`, `cn_state_fraction`,
-`allele_a_cn`, and `allele_b_cn`. The canonical row uses one representative
-state with fraction 1; optional `segment_cn_states` preserves other states.
+### Directory
 
-The likelihood uses the original representative **integer** CN, not weighted
-total CN. For multiple regional CNA states, the pair with the largest
-`(major_cn, minor_cn)` supplies representative CN; state fractions are
-retained as provenance. Supply normal CN or explicitly set
-`"normal_cn_policy": "diploid"`. A major-CN cutoff is optional and masks
-only that mutation–region pair. Missing reads default to ALT 0 and the region's
-median observed positive depth; set `"missing_counts": "unobserved"` to omit
-them from the likelihood.
+One directory represents one tumor; its region subfolders are fitted jointly:
+
+```text
+tumor/
+├── region1/
+│   ├── snv.txt
+│   ├── cna.txt
+│   └── purity.txt
+└── region2/          # same three files
+```
+
+Folder names define tumor/region IDs. See the [runnable example](examples/README.md).
+Each region requires:
+
+| File | Required contents |
+| --- | --- |
+| `snv.txt` | `chromosome_index`, `position`, `ref_count`, `alt_count` |
+| `cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn`, `total_cn` |
+| `purity.txt` | One number in `(0, 1]`, without a header |
+
+### TSV alternative
+
+Use `--input-file tumor.tsv` instead of `--input-dir` for one table combining
+all regions; gzip is supported.
+
+| Columns | Contents |
+| --- | --- |
+| `mutation_id`, `sample_id` | Mutation and region identifiers |
+| `alt_count`, `ref_count`, `count_observed` | Read counts and observation flag: 1 for observed, 0 for missing |
+| `purity`, `normal_cn` | Tumor purity in `(0, 1]` and nonnegative integer normal CN |
+| `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
+
+Use one representative row per mutation–region pair with CN state fraction 1.
+Optional `segment_cn_states` preserves the original multiple states.
 
 ## Output
 
-Each stage writes `{tumor_id}_mutation_clusters.tsv`,
-`{tumor_id}_cluster_centers.tsv`, and
-`{tumor_id}_mutation_region_multiplicity.tsv`. Stage 3 also writes
-`{tumor_id}_cluster_probabilities.tsv`. Label **0** is reserved for an active
-biological clonal class. Multiplicity is NA for missing, excluded, zero-depth,
-or zero-CCF pairs. The workflow root records fitted states, search coverage,
-the original catalog, and accounting for all original mutations.
+`--output-dir` contains exactly these three TSVs, with no subdirectories:
+
+| File | Columns |
+| --- | --- |
+| `{tumor_id}_mutation_clusters.tsv` | `tumor_id`, `mutation_id`, `cluster_label`, `phi_<region>` for each region |
+| `{tumor_id}_cluster_centers.tsv` | `tumor_id`, `cluster_label`, `cluster_size`, `phi_<region>` for each region |
+| `{tumor_id}_mutation_region_multiplicity.tsv` | `tumor_id`, `mutation_id`, `region_id`, `phi`, `multiplicity_call` |
+
+Label 0 denotes an active clonal class. Multiplicity is NA for missing,
+excluded, zero-depth, or zero-CCF pairs.
 
 ## Contact
 

@@ -1,42 +1,53 @@
-"""One command for the complete Protocol 3.0 CPU workflow."""
+"""One command for Protocol 3.0 CPU discovery and publication."""
 import argparse
-import json
 from pathlib import Path
 
-from .config import PLAN_SCHEMA, PROTOCOL_VERSION, WorkflowConfig
 from ._version import __version__
+from .config import DEFAULT_MAX_CLUSTERS, DEFAULT_MISSING_COUNTS, DEFAULT_PROPOSAL_BUDGET, FitConfig, WorkflowConfig
 
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="clipp2", allow_abbrev=False,
-        description="Discover, refine, and publish one clonal/single-copy-free mixture.")
+        description="Fit and publish one clonal/single-copy-free mixture.")
     parser.add_argument("--version", action="version", version=__version__)
-    workflow = parser.add_subparsers(dest="command", required=True).add_parser(
-        "workflow", allow_abbrev=False, help="Run the Protocol 3.0 CPU workflow from a v8 plan.")
-    workflow.add_argument("--plan", required=True)
-    workflow.add_argument("--output-dir", required=True)
+    fit = parser.add_subparsers(dest="command", required=True).add_parser(
+        "fit", allow_abbrev=False, help="Run one Stage 1 CPU fit.")
+    inputs = fit.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--input-dir", type=Path, help="Tumor directory with regional input files.")
+    inputs.add_argument("--input-file", type=Path, help="Canonical tumor TSV, optionally gzip-compressed.")
+    fit.add_argument("--device", choices=("cpu",), default="cpu", help="Execution device (CPU only).")
+    fit.add_argument("--output-dir", type=Path, required=True, help="New directory for results.")
+    fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
+                     help=f"Maximum biological clusters (default: {DEFAULT_MAX_CLUSTERS}).")
+    fit.add_argument("--max-major-cn", type=int, help="Optional major-CN cutoff.")
+    fit.add_argument("--cpu-threads", type=int, help="Optional BLAS thread limit.")
+    fit.add_argument("--proposal-budget", type=int, default=DEFAULT_PROPOSAL_BUDGET,
+                     help=f"Optional search proposals (default: {DEFAULT_PROPOSAL_BUDGET}).")
+    fit.add_argument("--normal-cn-policy", choices=("diploid",),
+                     help="Assume diploid normal CN where it was not supplied.")
+    fit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS,
+                     help=f"Missing read-count policy (default: {DEFAULT_MISSING_COUNTS}).")
+    fit.add_argument("--run-manifest-id", help="Optional provenance identifier.")
     return parser
 
 
-def load_plan(path):
-    plan = json.loads(path.read_text(encoding="utf-8"))
-    if (not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA
-            or plan.get("protocol_version") != PROTOCOL_VERSION):
-        raise ValueError("Protocol 3.0 requires clipp2.workflow.plan.v8. Migrate v7/2.5 plans; "
-                         "old fit records, assignment modes, read floors and cap settings are not replayable.")
-    extra = set(plan)-{"schema", "protocol_version", "input_path", "workflow_config", "run_manifest_id"}
-    if extra:
-        raise ValueError(f"Unknown workflow plan fields: {sorted(extra)}")
-    if not isinstance(plan.get("input_path"), str) or not plan["input_path"].strip():
-        raise ValueError("A nonempty input_path is required.")
-    return path.parent/plan["input_path"], WorkflowConfig.from_dict(plan.get("workflow_config", {})), plan.get("run_manifest_id")
-
-
 def main(argv=None):
-    args = build_parser().parse_args(argv)
-    path, config, run_manifest_id = load_plan(Path(args.plan).resolve())
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.input_dir is not None and not args.input_dir.is_dir():
+        parser.error(f"--input-dir must name an existing directory: {args.input_dir}")
+    if args.input_file is not None and not args.input_file.is_file():
+        parser.error(f"--input-file must name an existing file: {args.input_file}")
+    try:
+        config = WorkflowConfig(
+            fit=FitConfig(device=args.device, max_clusters=args.max_clusters, max_major_cn=args.max_major_cn,
+                          cpu_threads=args.cpu_threads, proposal_budget=args.proposal_budget),
+            normal_cn_policy=args.normal_cn_policy, missing_counts=args.missing_counts,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     from .workflow import run_workflow
-    run_workflow(path, args.output_dir, config, run_manifest_id=run_manifest_id)
+    run_workflow(args.input_dir or args.input_file, args.output_dir, config, run_manifest_id=args.run_manifest_id)
 
 
 if __name__ == "__main__":

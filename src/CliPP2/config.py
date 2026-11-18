@@ -5,12 +5,10 @@ from numbers import Integral
 from typing import Final
 
 DEFAULT_MAX_MAJOR_CN: Final = None
-DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
-DEFAULT_MAX_CLUSTERS: Final = 20
+DEFAULT_MAX_CLUSTERS: Final = 10
 DEFAULT_MISSING_COUNTS: Final = "zero_alt"
 DEFAULT_PROPOSAL_BUDGET: Final = 32
 PROTOCOL_VERSION: Final = "3.0"
-PLAN_SCHEMA: Final = "clipp2.workflow.plan.v8"
 MODEL_ID: Final = "fixed_clonal_single_copy_free_v1"
 
 
@@ -45,7 +43,7 @@ class FitConfig:
 
     device: str = "cpu"
     max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN
-    max_clusters: int = DEFAULT_STAGE_ONE_MAX_CLUSTERS
+    max_clusters: int = DEFAULT_MAX_CLUSTERS
     cpu_threads: int | None = None
     proposal_budget: int = DEFAULT_PROPOSAL_BUDGET
 
@@ -63,33 +61,17 @@ class FitConfig:
 
 @dataclass(frozen=True, slots=True)
 class WorkflowConfig:
-    """Discovery and refinement capacities count biological clusters."""
+    """Settings for one discovery fit and its input handling."""
 
     fit: FitConfig = field(default_factory=FitConfig)
-    stage_two_max_clusters: int = DEFAULT_MAX_CLUSTERS
-    stage_two_proposal_budget: int = DEFAULT_PROPOSAL_BUDGET
     normal_cn_policy: str | None = None
     missing_counts: str = DEFAULT_MISSING_COUNTS
 
     def __post_init__(self):
         if type(self.fit) is not FitConfig:
             raise TypeError("Workflow requires a validated FitConfig.")
-        _integer(self.stage_two_max_clusters, "stage_two_max_clusters")
-        _integer(self.stage_two_proposal_budget, "stage_two_proposal_budget", minimum=0)
         if self.normal_cn_policy not in (None, "diploid"):
             raise ValueError("normal_cn_policy must be None or 'diploid'.")
         validate_missing_counts(self.missing_counts)
-
-    @classmethod
-    def from_dict(cls, values):
-        if not isinstance(values, dict) or not isinstance(values.get("fit", {}), dict):
-            raise ValueError("workflow_config and its optional fit field must be objects.")
-        incompatible = (
-            {"fit_multiplicity", "selection_criterion", "max_multiplicity_difference"} & values.get("fit", {}).keys()
-        ) | ({"stage_three_assignment_method"} & values.keys())
-        if incompatible:
-            raise ValueError(f"Protocol 3.0 removed these fit/assignment options: {sorted(incompatible)}")
-        return cls(**(values | {"fit": FitConfig(**values.get("fit", {}))}))
-
 
 __all__ = ["FitConfig", "WorkflowConfig"]
