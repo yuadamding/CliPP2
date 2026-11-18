@@ -1,25 +1,15 @@
-"""Adapt regional SNV/CNA/purity bundles to the canonical input contract."""
-from __future__ import annotations
+"""Adapt regional SNV/CNA/purity bundles to validated observation rows."""
 
 from bisect import bisect_right
-import json
 from pathlib import Path
 
-import pandas as pd
-
-from .tumor_txt import (
-    SCHEMA_COLUMNS, TumorTxtError, _finite_float, _identifier,
-    _read_text_table, _safe_tumor_id, _validate_metadata, _provenance_flag,
-)
+from .cn_states import SegmentCNStates
+from .tumor_txt import TumorTxtError, _finite_float, _identifier, _provenance_flag, _read_text_table, _safe_tumor_id
 
 _FILES = ("snv.txt", "cna.txt", "purity.txt")
 _SNV_COLUMNS = ("chromosome_index", "position", "alt_count", "ref_count")
 _CNA_COLUMNS = ("chromosome_index", "start_position", "end_position",
                 "major_cn", "minor_cn", "total_cn")
-
-
-class _MissingProfileValue(TumorTxtError):
-    """A required regional value is absent, rather than outside its model domain."""
 
 
 def _regions(path: Path) -> tuple[Path, ...]:
@@ -47,173 +37,99 @@ def _regions(path: Path) -> tuple[Path, ...]:
 
 def _integer(value: str, *, name: str, minimum: int = 0) -> int:
     if value == ".":
-        raise _MissingProfileValue(f"{name} may not be missing.")
+        raise TumorTxtError(f"{name} may not be missing.")
     if not value.isascii() or not value.isdecimal() or int(value) < minimum:
         raise TumorTxtError(f"{name} must be an integer >= {minimum}.")
     return int(value)
 
 
-def _read_region(path: Path):
+def _read_region(path):
     tokens = (path / "purity.txt").read_text(encoding="utf-8").split()
-    if not tokens or tokens == ["."]:
-        raise _MissingProfileValue(f"{path}/purity.txt purity may not be missing.")
     if len(tokens) != 1:
         raise TumorTxtError(f"{path}/purity.txt must contain exactly one number.")
     purity = _finite_float(tokens[0], name=f"{path} purity")
     if not 0 < purity <= 1:
         raise TumorTxtError(f"{path} purity must lie in (0, 1].")
-    _, table = _read_text_table(path / "snv.txt", columns=_SNV_COLUMNS, canonical=False)
+
+    _, _, rows = _read_text_table(path / "snv.txt", columns=_SNV_COLUMNS, canonical=False)
     observations = {}
-    observation_rows = {}
-    for row in table.to_dict(orient="records"):
-        chrom = _identifier(row["chromosome_index"], name=f"{path} chromosome_index")
-        position = _integer(row["position"], name=f"{path} position", minimum=1)
-        locus = (chrom, position)
+    for row in rows:
+        locus = (_identifier(row["chromosome_index"], name=f"{path} chromosome_index"),
+                 _integer(row["position"], name=f"{path} position", minimum=1))
         if locus in observations:
             raise TumorTxtError(f"{path}: duplicate SNV locus {locus!r}.")
-        observed = _provenance_flag(row, ("count_observed",), "Read observation", default=True)
-        counts = tuple("." if row[name] == "." and not observed else _integer(row[name], name=f"{path} {name}")
+        observed = _provenance_flag(row, ("count_observed",), "Read observation")
+        counts = tuple(None if row[name] == "." and not observed else _integer(row[name], name=f"{path} {name}")
                        for name in ("alt_count", "ref_count"))
-        observations[locus] = (*counts, _provenance_flag(row, ("input_excluded",),
-                                                        "Input exclusion", default=False), observed)
-        observation_rows[locus] = row
-    _, table = _read_text_table(path / "cna.txt", columns=_CNA_COLUMNS,
-                                canonical=False, allow_empty=True)
+        observations[locus] = (*counts, observed, _provenance_flag(
+            row, ("input_excluded",), "Input exclusion", default=False))
+
+    _, columns, rows = _read_text_table(path / "cna.txt", columns=_CNA_COLUMNS, canonical=False, allow_empty=True)
     state_columns = {"cn_state_id", "cn_state_fraction"}
-    if state_columns.intersection(table.columns) and not state_columns.issubset(table.columns):
+    explicit = state_columns.issubset(columns)
+    if not explicit and state_columns.intersection(columns):
         raise TumorTxtError(f"{path}: CNA states require both cn_state_id and cn_state_fraction.")
-    explicit_states = state_columns.issubset(table.columns)
-    interval_groups = {}
-    interval_rows = {}
-    for row in table.to_dict(orient="records"):
+    groups = {}
+    for row in rows:
         chrom = _identifier(row["chromosome_index"], name=f"{path} chromosome_index")
         start, end = (_integer(row[name], name=f"{path} {name}", minimum=1)
                       for name in ("start_position", "end_position"))
-        major, minor, total, normal = (
-            _integer(row.get(name, "2"), name=f"{path} {name}")
-            for name in ("major_cn", "minor_cn", "total_cn", "normal_cn")
-        )
+        major, minor, total, normal = (_integer(row.get(name, "2"), name=f"{path} {name}")
+                                      for name in ("major_cn", "minor_cn", "total_cn", "normal_cn"))
         if start > end or major < minor or total != major + minor:
-            raise TumorTxtError(
-                f"{path}: invalid CNA interval {chrom}:{start}-{end}; require "
-                "start <= end, major_cn >= minor_cn and total_cn = major_cn + minor_cn."
-            )
-        normal_supplied = _provenance_flag(row, ("normal_cn_supplied", "_normal_cn_supplied"),
-                                           "Normal-CN", default="normal_cn" in row)
-        if normal_supplied and "normal_cn" not in row:
+            raise TumorTxtError(f"{path}: invalid CNA interval {chrom}:{start}-{end}; require "
+                                "start <= end, major_cn >= minor_cn and total_cn = major_cn + minor_cn.")
+        supplied = _provenance_flag(row, ("normal_cn_supplied", "_normal_cn_supplied"),
+                                    "Normal-CN", default="normal_cn" in row)
+        if supplied and "normal_cn" not in row:
             raise TumorTxtError(f"{path}: normal CN cannot be marked supplied without normal_cn.")
         genuine = _provenance_flag(row, ("mapping_genuine", "_mapping_genuine"), "Genuine-mapping")
-        interval_groups.setdefault((chrom, start, end), []).append(
-            (major, minor, normal, normal_supplied, genuine, row))
+        groups.setdefault((chrom, start, end), []).append((normal, supplied, genuine, major, minor, row))
+
     intervals = {}
-    from .cn_states import SegmentCNStates
-    for (chrom, start, end), states in interval_groups.items():
-        segment_id = f"{chrom}:{start}-{end}"
-        if len(states) > 1 and not explicit_states:
-            raise TumorTxtError(f"{path}: duplicate CNA interval {segment_id}; multiple states require "
+    for (chrom, start, end), group in groups.items():
+        segment = f"{chrom}:{start}-{end}"
+        normal, supplied, genuine, major, minor, _ = group[0]
+        if len(group) > 1 and not explicit:
+            raise TumorTxtError(f"{path}: duplicate CNA interval {segment}; multiple states require "
                                 "cn_state_id and cn_state_fraction.")
-        if any(state[2:5] != states[0][2:5] for state in states[1:]):
-            raise TumorTxtError(f"{path}: normal CN and provenance must agree across states of {segment_id}.")
-        encoded = None
-        if explicit_states:
-            validated = SegmentCNStates(tuple(dict(sample_id=path.name, segment_id=segment_id,
-                cn_state_id=state[5]["cn_state_id"], cn_state_fraction=state[5]["cn_state_fraction"],
-                major_cn=state[0], minor_cn=state[1]) for state in states))
-            encoded = json.dumps([dict(cn_state_id=state[2], cn_state_fraction=state[3],
-                                       major_cn=state[4], minor_cn=state[5])
-                                  for state in validated.records], separators=(",", ":"))
-        # Keep the original representative (major, minor) for scaling and the
-        # clonal multiplicity ceiling. Other states are retained as provenance.
-        major, minor, normal, normal_supplied, genuine, representative = max(
-            states, key=lambda state: (state[0], state[1], str(state[5].get("cn_state_id", ""))))
-        intervals.setdefault(chrom, []).append((start, end, major, minor, normal,
-                                               normal_supplied, genuine, encoded))
-        interval_rows[chrom, start, end] = representative
+        if any(row[:3] != group[0][:3] for row in group[1:]):
+            raise TumorTxtError(f"{path}: normal CN and provenance must agree across states of {segment}.")
+        states = None
+        if explicit:
+            states = SegmentCNStates(tuple((path.name, segment, row["cn_state_id"],
+                 row["cn_state_fraction"], a, b) for _, _, _, a, b, row in group)).records
+            # Preserve maximum representative CN, but a zero-fraction state is absent.
+            major, minor = max((a, b) for _, _, _, fraction, a, b in states if fraction > 0)
+        intervals.setdefault(chrom, []).append((start, end, segment, major, minor, normal, supplied, genuine, states))
+
     indexed = {}
     for chrom, segments in intervals.items():
         segments.sort()
         if any(right[0] <= left[1] for left, right in zip(segments, segments[1:])):
             raise TumorTxtError(f"{path}: overlapping CNA intervals on chromosome {chrom!r}.")
         indexed[chrom] = ([segment[0] for segment in segments], segments)
-    return purity, observations, indexed, observation_rows, interval_rows
+    return purity, observations, indexed
 
 
-def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tuple[dict[str, str], pd.DataFrame]:
-    """Join inclusive CN intervals, retaining genuine-mapping evidence by default."""
-    path = Path(path).resolve()
+def read_region_directory(path: Path):
+    """Yield typed, one-state observations after joining inclusive CNA intervals."""
     regions = {region.name: _read_region(region) for region in _regions(path)}
-    loci = sorted({locus for value in regions.values() for locus in value[1]})
-    has_exclusions = any(observation[2] for value in regions.values() for observation in value[1].values())
-    rows = []
-    for sample, value in regions.items():
-        purity, observations, intervals, observation_rows, interval_rows = value
-        for chrom, position in loci:
-            starts, segments = intervals.get(chrom, ([], []))
-            index = bisect_right(starts, position) - 1
-            genuine = index >= 0 and position <= segments[index][1]
-            if not genuine:
-                raise TumorTxtError(f"{path}: input_missing CN segment for mutation {chrom}:{position} "
-                                    f"in sample {sample!r}; run the input audit to inspect profile and segment mapping.")
-            start, end, major, minor, normal, normal_supplied, genuine, cn_states = segments[index]
-            alt, ref, excluded, observed = observations.get((chrom, position), (".", ".", False, False))
-            row = dict(zip(SCHEMA_COLUMNS, (f"{chrom}:{position}", sample, alt, ref, int(observed), purity,
-                         normal, f"{chrom}:{start}-{end}", "0", 1, major, minor)))
-            row.update(_mapping_genuine=genuine, _normal_cn_supplied=normal_supplied)
-            if cn_states is not None:
-                row["segment_cn_states"] = cn_states
-            if has_exclusions:
-                row["input_excluded"] = int(excluded)
-            if preserve_provenance:
-                row.update(chromosome_index=chrom, position=position,
-                           start_position=start, end_position=end)
-                row.update(("snv_"+key, cell) for key, cell in observation_rows.get((chrom, position), {}).items())
-                row.update(("cna_"+key, cell) for key, cell in interval_rows.get((chrom, start, end), {}).items())
-            rows.append(row)
-    metadata = _validate_metadata({"tumor_id": _safe_tumor_id(path.name),
-                                  "mutation_key_convention": "chromosome_index:position"}, path=path)
-    table = pd.DataFrame(rows).fillna(".")
-    return metadata, table if preserve_provenance else table.loc[:, [*SCHEMA_COLUMNS,
-        "_mapping_genuine", "_normal_cn_supplied", *(["input_excluded"] if has_exclusions else []),
-        *(["segment_cn_states"] if "segment_cn_states" in table else [])]]
+    loci = sorted({locus for _, observations, _ in regions.values() for locus in observations})
 
+    def rows():
+        for sample, (purity, observations, intervals) in regions.items():
+            for chrom, position in loci:
+                starts, segments = intervals.get(chrom, ([], []))
+                idx = bisect_right(starts, position) - 1
+                if idx < 0 or position > segments[idx][1]:
+                    raise TumorTxtError(f"{path}: input_missing CN segment for mutation {chrom}:{position} "
+                                        f"in sample {sample!r}; supply an inclusive covering CNA interval.")
+                _, _, segment, major, minor, normal, supplied, genuine, states = segments[idx]
+                alt, ref, observed, excluded = observations.get((chrom, position), (None, None, False, False))
+                yield dict(mutation_id=f"{chrom}:{position}", sample_id=sample, alt_count=alt,
+                           ref_count=ref, count_observed=observed, input_excluded=excluded, purity=purity,
+                           allele_a_cn=major, allele_b_cn=minor, normal_cn=normal, normal_cn_supplied=supplied,
+                           mapping_genuine=genuine, segment_id=segment, segment_cn_states=states)
 
-def audit_region_directory(path):
-    """Inspect requested profiles and segment joins without filling missing CN."""
-    path = Path(path).resolve()
-    direct = any((path / name).exists() for name in _FILES)
-    children = tuple(sorted(child for child in path.iterdir() if child.is_dir()
-                            and any((child / name).exists() for name in _FILES)))
-    issues = []
-    if direct and children:
-        return [dict(status="input_invalid", code="ambiguous_region_layout", source=str(path),
-                     cause="tumor_region_mapping", message="Root and regional bundles are both present")]
-    regions = (path,) if direct or not children else children
-    parsed = {}
-    for region in regions:
-        missing = [name for name in _FILES if not (region / name).is_file()]
-        for name in missing:
-            issues.append(dict(status="input_missing", code="missing_profile", source=str(region / name),
-                sample_id=region.name, field=name, cause="profile_unavailable_or_unmapped",
-                message="Recover the source profile or correct the tumor/region path; no values were inferred"))
-        if missing:
-            continue
-        try:
-            parsed[region.name] = _read_region(region)
-        except (OSError, ValueError) as error:
-            missing = isinstance(error, _MissingProfileValue)
-            issues.append(dict(status="input_missing" if missing else "input_invalid",
-                               code="missing_profile_value" if missing else "invalid_profile", source=str(region),
-                               sample_id=region.name, cause="profile_content", message=str(error)))
-    loci = sorted({locus for value in parsed.values() for locus in value[1]})
-    for sample, (_, _, intervals, _, _) in parsed.items():
-        for chrom, position in loci:
-            starts, segments = intervals.get(chrom, ([], []))
-            index = bisect_right(starts, position) - 1
-            if index >= 0 and position <= segments[index][1]:
-                continue
-            equivalent = [key for key in intervals if key.removeprefix("chr") == chrom.removeprefix("chr")]
-            issues.append(dict(status="input_missing", code="missing_cn_segment", sample_id=sample,
-                mutation_id=f"{chrom}:{position}", source=str(path), field="tumor_cn",
-                cause="chromosome_naming" if equivalent else "segment_join",
-                message="No supplied CN interval covers this mutation-region; no diploid CN was inferred"))
-    return issues
+    return _safe_tumor_id(path.name), rows()

@@ -16,8 +16,12 @@ This CPU implementation needs no C++ compiler, CUDA, or PyTorch.
 ## Run
 
 ```bash
-clipp2 fit --input-dir tumor/ --device cpu --output-dir results/
+clipp2 fit --input-dir tumor/ --output-dir results/
 ```
+
+Use a new output directory. Fits run on CPU; `--max-clusters` defaults to 10.
+`--max-major-cn` optionally excludes individual mutation–region pairs based on
+their representative major CN; there is no cutoff by default.
 
 ## Input
 
@@ -40,23 +44,13 @@ Each region requires:
 | File | Required contents |
 | --- | --- |
 | `snv.txt` | `chromosome_index`, `position`, `ref_count`, `alt_count` |
-| `cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn`, `total_cn` |
+| `cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn`, `total_cn`; supply `normal_cn` or use `--normal-cn-policy diploid` |
 | `purity.txt` | One number in `(0, 1]`, without a header |
 
-### TSV alternative
-
-Use `--input-file tumor.tsv` instead of `--input-dir` for one table combining
-all regions; gzip is supported.
-
-| Columns | Contents |
-| --- | --- |
-| `mutation_id`, `sample_id` | Mutation and region identifiers |
-| `alt_count`, `ref_count`, `count_observed` | Read counts and observation flag: 1 for observed, 0 for missing |
-| `purity`, `normal_cn` | Tumor purity in `(0, 1]` and nonnegative integer normal CN |
-| `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
-
-Use one representative row per mutation–region pair with CN state fraction 1.
-Optional `segment_cn_states` preserves the original multiple states.
+CNA intervals are inclusive and must cover the joint SNV list in every region.
+To supply multiple CN states per interval, include `cn_state_id` and
+`cn_state_fraction`. The fit uses the state with the largest major CN, then
+minor CN, among positive-fraction states; it does not fit a mixture of CN states.
 
 ## Output
 

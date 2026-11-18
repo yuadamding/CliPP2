@@ -8,7 +8,6 @@ import numpy as np
 from scipy.special import logsumexp
 
 from .clonal_mixture import MixtureConvergenceError, fit_start
-from .scoring import WeightConvergenceError
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,10 +31,9 @@ def _interior(centers):
 
 class _PilotGeometry:
     def __init__(self, model):
-        self.order = np.argsort(np.asarray(model.mutation_ids, dtype=str), kind='stable')
-        self.points = np.asarray(model.pilots, dtype=float)[self.order]
-        self.observed = np.asarray(model.observed)[self.order]
-        self.pooled = np.asarray(model.pooled_pilots, dtype=float)
+        self.points = model.pilots
+        self.observed = model.observed
+        self.pooled = model.pooled_pilots
         if (self.points.shape != (model.n, model.r) or self.pooled.shape != (model.r,)
                 or not np.array_equal(np.isfinite(self.points), self.observed)
                 or not self.observed.any(axis=1).all() or not np.isfinite(self.pooled).all()):
@@ -163,8 +161,8 @@ def _proposals(model, geometry, parent, family, capacity, templates):
         log_g = logsumexp(original, axis=1)
         # Use a bounded shortlist; likelihood-ranking every raw mutation
         # vector against every observation would require N squared work.
-        depth = model.depth.sum(axis=1)[geometry.order]
-        poor = np.argsort(log_g[geometry.order]/depth, kind='stable')[:16]
+        depth = model.depth.sum(axis=1)
+        poor = np.argsort(log_g/depth, kind='stable')[:16]
         pool = np.vstack((geometry.pooled, np.where(geometry.observed[poor], geometry.values[poor], geometry.pooled)))
         pool = _interior(pool)
         _, first = np.unique(pool, return_index=True, axis=0)
@@ -180,13 +178,13 @@ def _proposals(model, geometry, parent, family, capacity, templates):
 
     if (family == 'split' and (not can_grow or not q)) or (family == 'split_merge' and q < 3) or (family == 'transfer' and q < 2):
         return
-    responsibility = parent.responsibilities[geometry.order]
+    responsibility = parent.responsibilities
     biological = (np.c_[responsibility[:, :c].sum(axis=1), responsibility[:, c:]]
                   if c else responsibility)
     labels = np.argmax(biological, axis=1)-bool(c)
     members = [np.flatnonzero(labels == i) for i in range(q)]
     if family == 'transfer':
-        columns = model.log_columns((), centers)[geometry.order]
+        columns = model.log_columns((), centers)
         for source, rows in enumerate(members):
             if len(rows) < 2:
                 continue
@@ -227,7 +225,7 @@ def _proposals(model, geometry, parent, family, capacity, templates):
 
 
 def search(model, *, max_clusters, proposal_budget=32,
-           progress_callback=None, comparison_seeds=(), max_iterations=2000, gradient_tolerance=1e-5):
+           progress_callback=None, max_iterations=2000, gradient_tolerance=1e-5):
     """Try every biological count before bounded optional proposals."""
     if (isinstance(max_clusters, bool) or not isinstance(max_clusters, Integral) or max_clusters < 1
             or isinstance(proposal_budget, bool) or not isinstance(proposal_budget, Integral) or proposal_budget < 0):
@@ -240,7 +238,7 @@ def search(model, *, max_clusters, proposal_budget=32,
     # Use canonical V to represent the structurally identical single-copy pair.
     templates = ((), ('V',)) if model.structural_uv_equal else ((), ('U',), ('V',), ('U', 'V'))
     geometry = _PilotGeometry(model)
-    seen, records, attempts, skipped = {}, [], Counter(), Counter()
+    seen, failures, attempts, skipped = {}, [], Counter(), Counter()
     bank, accepted = {}, 0
     best = None
     families = ('birth', 'split', 'merge', 'transfer', 'split_merge', 'template', 'promotion')
@@ -287,48 +285,41 @@ def search(model, *, max_clusters, proposal_budget=32,
             raise ValueError('Seed weights must be finite and nonnegative with positive total mass')
         weights = weights/weights.sum()
         key = _key(template, centers, weights)
-        record = dict(family=family, phase=phase, template=list(template), free_count=len(centers),
-                      requested_biological_count=len(centers)+bool(template) if bio_count is None else bio_count)
         if key in seen:
             skipped[family] += 1
-            records.append(dict(record, status='duplicate_start', reason='exact_same_template_centers_and_weights'))
             return seen[key], False, None
+        record = dict(family=family, phase=phase, template=list(template), free_count=len(centers),
+                      requested_biological_count=len(centers)+bool(template) if bio_count is None else bio_count)
         attempts[family] += 1
         try:
             fit = fit_start(model, template, centers, weights, max_iterations=max_iterations,
                             gradient_tolerance=gradient_tolerance)
-        except (MixtureConvergenceError, WeightConvergenceError) as exc:
+        except MixtureConvergenceError as exc:
             seen[key] = False
-            records.append(dict(record, status='failed', reason=str(exc)))
-            emit(records[-1])
+            failure = dict(record, status='failed', reason=str(exc))
+            if len(failures) < 8:
+                failures.append(failure)
+            emit(failure)
             return False, True, None
         seen[key] = True
         advancing = account(fit)
-        records.append(dict(record, status='accepted', bic=float(fit.bic), active_template=list(fit.template),
-                            active_biological_count=fit.biological_count))
-        emit(records[-1])
+        emit(dict(record, status='accepted', bic=float(fit.bic), active_template=list(fit.template),
+                  active_biological_count=fit.biological_count))
         return True, True, fit if advancing else None
 
     # A free-count start is built once and evaluated under each eligible
     # template. A two-term clonal template uses only one biological slot.
-    coverage = {k: [] for k in range(1, capacity+1)}
+    coverage = {}
     for free_count, seeds in enumerate(geometry.seed_families(capacity)):
         for template in templates:
             biological = free_count+bool(template)
-            if biological not in coverage:
+            if not 1 <= biological <= capacity:
                 continue
             for family, centers in zip(('farthest_point', 'recursive_split'), seeds):
                 result, _, _ = admit(_Start(template, centers), family, 'mandatory', bio_count=biological)
-                coverage[biological].append(result)
-    covered = {k for k, ok in coverage.items() if ok and all(ok)}
-    for seed in comparison_seeds:
-        cert = _Start(tuple(getattr(seed, 'template', ())), np.asarray(getattr(seed, 'centers', seed)),
-                      getattr(seed, 'weights', None))
-        if len(cert.centers)+bool(cert.template) > capacity:
-            raise ValueError('Comparison seed exceeds the biological capacity')
-        admit(cert, 'comparison_seed', 'comparison')
+                coverage[biological] = coverage.get(biological, True) and result
+    covered = {k for k, ok in coverage.items() if ok}
     if best is None:
-        failures = [entry for entry in records if entry['status'] == 'failed']
         raise MixtureConvergenceError(f'No numerically qualified mixture start; failures: {failures}')
 
     def schedule(parent):
@@ -370,6 +361,6 @@ def search(model, *, max_clusters, proposal_budget=32,
         covered_counts=sorted(covered), incomplete_counts=sorted(set(range(1, capacity+1))-covered),
         proposal_budget=int(proposal_budget),
         proposal_attempts=proposal_attempts, attempts_by_family=dict(attempts), duplicates_by_family=dict(skipped),
-        qualified_attempts=accepted, frontier_strata=len(bank), attempts=records,
+        qualified_attempts=accepted, frontier_strata=len(bank), failure_examples=failures,
         selected_bic=float(best.bic), selected_biological_count=best.biological_count,
         exhaustive_search=False, global_optimality_claimed=False))

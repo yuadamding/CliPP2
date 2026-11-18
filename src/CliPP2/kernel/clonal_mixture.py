@@ -64,19 +64,29 @@ def _single_copy_coordinate(alt_mass, slopes, ref_mass):
     return float(brentq(score, 0., 1., xtol=1e-15))
 
 
+def binomial_log_mass(constant, alt, ref, probability):
+    """Log binomial mass, including exact endpoint probabilities."""
+    p = np.minimum(1., probability)
+    return constant + xlogy(alt, p) + xlog1py(ref, -p)
+
+
+def _log_support_count(minimum, region_count, above_minimum):
+    """Log of (minimum - 1) * (2**region_count - 1) + 2**above_minimum."""
+    lower = np.log(minimum - 1, out=np.full_like(minimum, -np.inf, dtype=float), where=minimum > 1)
+    return np.logaddexp(lower + region_count*math.log(2.) + np.log1p(-np.exp2(-region_count.astype(float))),
+                        above_minimum*math.log(2.))
+
+
 def _clonal_uniform(model):
     """Log-domain range-one DP by the unique minimum of an admissible vector."""
     mask = model.observed
     major = model.major
     cap = np.where(mask, major, np.iinfo(np.int64).max).min(axis=1)
     partition = np.full(model.n, -np.inf)
-    count = np.full_like(partition, -np.inf)
     for anchor in range(1, int(cap.max()) + 1):
         rows = np.flatnonzero(cap >= anchor)
         no_min = np.zeros(len(rows))
         has_min = np.full(len(rows), -np.inf)
-        no_min_count = no_min.copy()
-        has_min_count = has_min.copy()
         for r in range(model.r):
             used = mask[rows, r]
             if not used.any():
@@ -86,20 +96,13 @@ def _clonal_uniform(model):
             b = model.ref[idx, r]
             allow_hi = major[idx, r] > anchor
             slope = model.scaling[idx, r]
-            low = np.minimum(1., slope * anchor)
-            high = np.minimum(1., slope * (anchor + 1))
             constant = model.constants[idx, r]
-            x = constant + xlogy(a, low) + xlog1py(b, -low)
-            y = np.where(allow_hi, constant + xlogy(a, high) + xlog1py(b, -high), -np.inf)
+            x = binomial_log_mass(constant, a, b, slope * anchor)
+            y = np.where(allow_hi, binomial_log_mass(constant, a, b, slope * (anchor + 1)), -np.inf)
             has_min[used] = np.logaddexp(has_min[used] + np.logaddexp(x, y), no_min[used] + x)
             no_min[used] += y
-            hi_count = np.where(allow_hi, 0., -np.inf)
-            has_min_count[used] = np.logaddexp(
-                has_min_count[used] + np.logaddexp(0., hi_count), no_min_count[used])
-            no_min_count[used] += hi_count
         partition[rows] = np.logaddexp(partition[rows], has_min)
-        count[rows] = np.logaddexp(count[rows], has_min_count)
-    return partition - count
+    return partition - _log_support_count(cap, mask.sum(axis=1), (mask & (major > cap[:, None])).sum(axis=1))
 
 
 class ClonalModel:
@@ -109,18 +112,18 @@ class ClonalModel:
         if not isinstance(data, TumorData):
             raise TypeError("ClonalModel requires validated TumorData")
         self.data = data
-        mask = data.count_observed & ~data.input_excluded & (data.total_counts > 0)
+        mask = data.informative
         ids, regions = data.mutation_ids, data.region_ids
         rows = sorted(np.flatnonzero(mask.any(axis=1)), key=ids.__getitem__)
         cols = sorted(range(len(regions)), key=regions.__getitem__)
         if not rows:
             raise ValueError("No informative positive-depth mutation remains")
-        self.active_indices = readonly_array(rows, dtype=int)
-        self.region_indices = readonly_array(cols, dtype=int)
         ix = np.ix_(rows, cols)
         self.mutation_ids = tuple(ids[i] for i in rows)
         self.region_ids = tuple(regions[j] for j in cols)
         self.observed = readonly_array(mask[ix])
+        self.measured = readonly_array(data.measured[ix])
+        self.excluded = readonly_array(data.input_excluded[ix])
         self.n, self.r = self.observed.shape
         if not self.observed.any(axis=0).all():
             absent = [r for j, r in enumerate(self.region_ids) if not self.observed[:, j].any()]
@@ -131,6 +134,9 @@ class ClonalModel:
         self.major = readonly_array(data.major_cn[ix], dtype=np.int64)
         purity = data.purity[ix]
         denominator = (1.-purity)*data.normal_cn[ix] + purity*data.total_cn[ix]
+        # Keep the old neutral numerical slope and reduction grouping for
+        # excluded pairs without replacing any supplied CN in TumorData.
+        denominator = np.where(self.excluded, (1.-purity)*2. + purity*2., denominator)
         if not np.isfinite(denominator).all() or np.any(denominator <= 0):
             raise ValueError("Normal-plus-tumor denominator must be finite and positive")
         self.scaling = readonly_array(purity / denominator)
@@ -155,8 +161,7 @@ class ClonalModel:
         return _single_copy_coordinate(alt, slopes, ref_mass)
 
     def regional_columns(self, center):
-        p = np.minimum(1., self.scaling * center)
-        return self.constants + xlogy(self.alt, p) + xlog1py(self.ref, -p)
+        return binomial_log_mass(self.constants, self.alt, self.ref, self.scaling * center)
 
     def log_columns(self, template, centers):
         columns = [self.log_u if kind == "U" else self.log_v for kind in _template(template)]
@@ -173,15 +178,12 @@ def _template(template):
     return template
 
 
-def _canonical(model, template, centers, weights, *, active_only, promote):
+def _canonical(model, template, centers, weights, *, promote):
     fixed, free = {}, {}
     for i, kind in enumerate(template):
-        if not active_only or weights[i] > 0.:
-            key = "V" if model.structural_uv_equal else kind
-            fixed[key] = fixed.get(key, 0.) + weights[i]
+        key = "V" if model.structural_uv_equal else kind
+        fixed[key] = fixed.get(key, 0.) + weights[i]
     for center, w in zip(centers, weights[len(template):]):
-        if active_only and not w > 0.:
-            continue
         if promote and np.all(center == 1.):
             fixed["V"] = fixed.get("V", 0.) + w
         else:
@@ -189,14 +191,10 @@ def _canonical(model, template, centers, weights, *, active_only, promote):
             free[key] = free.get(key, 0.) + w
     template = tuple(sorted(fixed))
     # Lexicographic sorting gives stable digest keys across equivalent starts.
-    centers = np.asarray(sorted(free)).reshape(-1, model.r)
-    weights = np.array([fixed[key] for key in template] + [free[key] for key in sorted(free)])
+    ordered = sorted(free)
+    centers = np.asarray(ordered).reshape(-1, model.r)
+    weights = np.array([fixed[key] for key in template] + [free[key] for key in ordered])
     return template, centers, weights / weights.sum()
-
-
-def canonical_components(model, template, centers, weights):
-    """Exact, likelihood-preserving role cleanup of an active mixture."""
-    return _canonical(model, _template(template), centers, weights, active_only=True, promote=True)
 
 
 @dataclass
@@ -283,7 +281,7 @@ def _rescue(model, template, state, iterations, tolerance):
     return _evaluate(model, template, best.centers, state.weights, columns=best.columns)
 
 
-def _refine(model, template, state, maximum, tolerance, trace):
+def _refine(model, template, state, maximum, tolerance):
     for iteration in range(maximum + 1):
         gradient, residual = center_gradient(model, template, state)
         # A coordinate infinitesimally inside its active face may have an
@@ -299,12 +297,10 @@ def _refine(model, template, state, maximum, tolerance, trace):
             roundoff = epsilon * (1. + abs(state.log_likelihood))
             if trial.log_likelihood >= state.log_likelihood - roundoff:
                 state = trial
-                trace.append(state.log_likelihood)
                 _, residual = center_gradient(model, template, state)
         if residual <= tolerance:
             if state.weight_fit is None:
                 state = _evaluate(model, template, state.centers, state.weights, columns=state.columns)
-                trace.append(state.log_likelihood)
                 _, residual = center_gradient(model, template, state)
             if residual <= tolerance:
                 return state, residual, iteration
@@ -320,7 +316,6 @@ def _refine(model, template, state, maximum, tolerance, trace):
                 new = _rescue(model, template, state, min(32, maximum-iteration), tolerance)
         if new.log_likelihood >= state.log_likelihood:
             state = new
-        trace.append(state.log_likelihood)
     raise MixtureConvergenceError(f"Free centers failed projected stationarity: residual={residual:.3g}")
 
 
@@ -344,8 +339,7 @@ def fit_start(model, template, centers, weights=None, *, max_iterations=2000, gr
             or not np.isclose(weights.sum(), 1., atol=1e-12, rtol=0.)):
         raise ValueError("Initial mixture weights must lie on the probability simplex")
     requested_template = template
-    template, centers, weights = _canonical(model, template, centers, weights,
-                                             active_only=False, promote=False)
+    template, centers, weights = _canonical(model, template, centers, weights, promote=False)
     interior_restart = False
     try:
         try:
@@ -356,14 +350,13 @@ def fit_start(model, template, centers, weights=None, *, max_iterations=2000, gr
             # A seed at an infeasible face is not a restriction on free CCFs.
             state = _evaluate(model, template, (centers+.5)/2., weights)
             interior_restart = True
-        trace = [state.log_likelihood]
         iterations = 0
         while True:
             state, residual, steps = _refine(
-                model, template, state, max_iterations-iterations, gradient_tolerance, trace)
+                model, template, state, max_iterations-iterations, gradient_tolerance)
             iterations += steps
             canonical = _canonical(model, template, state.centers, state.weights,
-                                   active_only=False, promote=True)
+                                   promote=True)
             new_template, new_centers, new_weights = canonical
             if new_template == template and np.array_equal(new_centers, state.centers):
                 break
@@ -372,7 +365,6 @@ def fit_start(model, template, centers, weights=None, *, max_iterations=2000, gr
             if simplified.log_likelihood < state.log_likelihood - 1e-8:
                 raise MixtureConvergenceError("Exact role canonicalization reduced likelihood")
             state = simplified
-            trace.append(state.log_likelihood)
     except WeightConvergenceError as exc:
         raise MixtureConvergenceError(str(exc)) from exc
     # Zero weights were allowed to enter up to the final weight MLE. Only then
@@ -387,7 +379,7 @@ def fit_start(model, template, centers, weights=None, *, max_iterations=2000, gr
                      state.posterior[:, used], dict(
                          requested_template=requested_template, qualified_template=template,
                          interior_restart=interior_restart, iterations=iterations,
-                         log_likelihood_trace=trace, projected_gradient_residual=residual,
+                         projected_gradient_residual=residual,
                          gradient_tolerance=gradient_tolerance, global_optimality_claimed=False,
                          weight_optimality_gap=state.weight_fit["weight_optimality_gap"],
                          weight_active_score_gap=state.weight_fit["weight_active_score_gap"]))

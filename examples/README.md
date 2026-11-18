@@ -3,7 +3,7 @@
 From the repository root, fit the [two-region tumor](tumor/):
 
 ```sh
-clipp2 fit --input-dir examples/tumor/ --device cpu --output-dir results/example
+clipp2 fit --input-dir examples/tumor/ --output-dir results/example
 ```
 
 For one region, use `--input-dir examples/tumor/region1/`. The three

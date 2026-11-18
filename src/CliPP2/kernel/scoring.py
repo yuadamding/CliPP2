@@ -10,23 +10,7 @@ class WeightConvergenceError(RuntimeError):
     """Finite weight iterates failed the existing fixed-budget stationarity gate."""
 
 
-def completed_weight(callback, q, *, cached=False, failed=False):
-    """One detached completed-solve snapshot, never an optimizer-request tape."""
-    if callback is not None:
-        callback(dict(operation="weight_fit", occupied_q=int(q),
-                      boundary="cache_hit" if cached else "solve_failed" if failed else "solve_complete"))
-
-
-def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, progress_callback=None):
-    """Fit CPU log-emission columns and report one completed-solve snapshot."""
-    if progress_callback is not None and not callable(progress_callback):
-        raise TypeError("progress_callback must be callable or None")
-    result = _fit_mixture_weights(log_columns, initial_weights, telemetry=telemetry)
-    completed_weight(progress_callback, len(result["cluster_weights"]))
-    return result
-
-
-def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
+def fit_mixture_weights(log_columns, initial_weights=None):
     """Maximize the joint observed likelihood of an N-by-q log-emission matrix.
 
     This is a concave weight problem. The reported Frank-Wolfe gap bounds the
@@ -35,11 +19,6 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     by the caller. This solves only the weight problem for the permitted
     columns, not the joint center problem or model selection.
     """
-    def record(name, amount=1):
-        if telemetry is not None:
-            telemetry[name] = telemetry.get(name, 0) + amount
-
-    record("weight_problem_calls")
     log_kernel = np.asarray(log_columns, dtype=float)
     if (log_kernel.ndim != 2 or not all(log_kernel.shape)
             or np.isnan(log_kernel).any() or np.isposinf(log_kernel).any()):
@@ -79,11 +58,7 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
             underflow = mass < np.finfo(float).tiny
             if underflow.any():
                 value[underflow] = logsumexp(shifted[underflow] + log_weights, axis=1)
-                record("weight_log_domain_fallback_rows", int(underflow.sum()))
             mass_key, mass_value = key, value
-            record("weight_matvec_calls")
-        else:
-            record("weight_matvec_cache_hits")
         return mass_value
 
     def objective(w):
@@ -111,12 +86,10 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     warm_gap = max(0., float(warm_score.max()-1.))
     warm_active_gap = float(warm_score.max()-warm_score[weights > 0].min())
     if warm_gap <= tolerance and warm_active_gap <= tolerance:
-        record("weight_warm_start_hits")
         return {"cluster_weights": weights,
                 "log_likelihood": float(np.sum(offset+log_mass(weights))),
                 "weight_optimality_gap": n*warm_gap,
                 "weight_active_score_gap": warm_active_gap}
-    record("weight_slsqp_calls")
     fit = minimize(
         objective,
         weights,
@@ -126,7 +99,6 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
         constraints={"type": "eq", "fun": lambda w: w.sum() - 1.0, "jac": lambda w: np.ones(k)},
         options={"ftol": 1e-13, "maxiter": 2000},
     )
-    record("weight_slsqp_iterations", int(fit.nit))
     if np.all(np.isfinite(fit.x)):
         candidate = np.maximum(fit.x, 0.0)
         if candidate.sum() > 0:
@@ -153,7 +125,6 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
         shrink = int(positive[np.argmin(score[positive])])
         if grow == shrink:
             break
-        record("weight_transfer_steps")
         # Exact one-dimensional mass transfer, evaluated in the log domain
         # at endpoints too; no tiny-mass replacement changes its objective.
         amount = weights[shrink]
@@ -184,7 +155,6 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     if not np.isfinite([objective(weights), optimality_gap, active_gap]).all():
         raise FloatingPointError("Cluster-weight likelihood optimization produced invalid arithmetic")
     if optimality_gap > n * tolerance or active_gap > tolerance:
-        record("weight_convergence_failures")
         raise WeightConvergenceError("Cluster-weight likelihood optimization did not converge")
     likelihood = float(np.sum(offset + log_mass(weights)))
     result = {

@@ -8,11 +8,9 @@ from ._version import __version__
 
 _EXPORTS = {
     "FitConfig": ".config",
+    "FitResult": ".workflow",
     "TumorData": ".io.data",
     "load_tumor_txt": ".io.tumor_txt",
-    "WorkflowConfig": ".config",
-    "OriginalCatalog": ".io.data",
-    "load_original_catalog": ".io.tumor_txt",
     "run_workflow": ".workflow",
 }
 

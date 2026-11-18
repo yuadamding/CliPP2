@@ -1,75 +1,29 @@
-"""Resolve missing reads once; frozen catalogs retain raw rows and imputation evidence."""
-from collections import Counter
+"""Resolve missing reads once from the original eligible measured population."""
 
 from ..config import validate_missing_counts
 
 
-def _eligible(row, cutoff):
-    return not row["input_excluded"] and (cutoff is None or row["allele_a_cn"] <= cutoff)
-
-
-def resolve_read_counts(rows, *, cutoff, policy):
-    """Set missing ALT to zero and REF to the region's eligible observed median.
-
-    Median ties at half a read round upward. Imputed, excluded and zero-depth
-    pairs never donate depth. An absent usable regional depth is an error, not
-    permission to invent one. Explicit observed zero-depth pairs stay unchanged.
-    Counts on explicitly unobserved rows never override the regional median.
-    """
+def resolve_read_counts(rows, *, policy):
+    """Impute eligible missing ALT=0 and regional median depth (half up)."""
     validate_missing_counts(policy)
-    if policy == "unobserved":
-        return rows, ()
-    depths = {}
-    for row in rows.values():
-        if _eligible(row, cutoff) and row["count_observed"]:
-            depth = row["alt_count"] + row["ref_count"]
-            if depth > 0:
-                depths.setdefault(row["sample_id"], []).append(depth)
+    depths, missing = {}, []
+    for (mutation, region), row in rows.items():
+        alt, ref = row["alt_count"] or 0, row["ref_count"] or 0
+        depth = alt + ref
+        row.update(alt_count=alt, depth=depth, count_imputed=False)
+        if policy == "zero_alt" and not row["input_excluded"]:
+            if not row["count_observed"]:
+                missing.append((mutation, region))
+            elif depth > 0:
+                depths.setdefault(region, []).append(depth)
     medians = {}
-    for region, values in depths.items():
-        values.sort()
-        medians[region] = (values[(len(values)-1)//2] + values[len(values)//2] + 1)//2
-    records = []
-    for (mutation, region), row in sorted(rows.items()):
-        if row["count_observed"] or not _eligible(row, cutoff):
-            continue
-        depth = medians.get(region)
-        if depth is None:
-            raise ValueError(f"Missing reads for {mutation!r}/{region!r} require eligible observed "
-                             "positive depths in that region; no regional median is available.")
-        records.append((mutation, region, depth, "regional_median"))
-    records = tuple(records)
-    return replay_read_counts(rows, records, cutoff=cutoff, policy=policy), records
-
-
-def replay_read_counts(rows, records, *, cutoff, policy):
-    """Validate and apply a frozen imputation ledger, never recomputing subset medians."""
-    validate_missing_counts(policy)
-    resolved = dict(rows)
-    expected = {key for key, row in rows.items() if policy == "zero_alt"
-                and not row["count_observed"] and _eligible(row, cutoff)}
-    seen, medians = set(), {}
-    for record in records:
-        if not isinstance(record, (tuple, list)) or len(record) != 4:
-            raise ValueError("Read-count imputation requires mutation, region, positive depth and depth source")
-        mutation, region, depth, method = record
-        key = mutation, region
-        if key not in expected or key in seen or type(depth) is not int or depth < 1:
-            raise ValueError("Invalid, duplicate or ineligible read-count imputation")
-        seen.add(key)
-        row = rows[key]
-        if method != "regional_median":
-            raise ValueError("Read-count imputation requires regional median depth")
-        if medians.setdefault(region, depth) != depth:
-            raise ValueError("Frozen regional median depths must agree within each region")
-        resolved[key] = dict(row, alt_count=0, ref_count=depth, count_observed=True)
-    if seen != expected:
-        raise ValueError("Read-count imputation ledger does not cover exactly the eligible missing pairs")
-    return resolved
-
-
-def read_count_report(policy, records):
-    return dict(policy=policy, imputed_pairs=len(records),
-                depth_sources=dict(Counter(record[3] for record in records)),
-                regional_medians={record[1]: record[2] for record in records if record[3] == "regional_median"},
-                median_population="eligible_observed_positive_depth_pairs", median_rounding="half_up")
+    for mutation, region in sorted(missing):
+        if region not in medians:
+            values = depths.get(region)
+            if not values:
+                raise ValueError(f"Missing reads for {mutation!r}/{region!r} require eligible observed "
+                                 "positive depths in that region; no regional median is available.")
+            values.sort()
+            medians[region] = (values[(len(values)-1)//2] + values[len(values)//2] + 1)//2
+        rows[mutation, region].update(alt_count=0, depth=medians[region], count_imputed=True)
+    return dict(policy=policy, imputed_pairs=len(missing), regional_medians=medians)

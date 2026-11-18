@@ -85,22 +85,6 @@ class SegmentCNStates:
                                     f"observed {total:.17g}.")
         object.__setattr__(self, "records", records)
 
-    @property
-    def weighted_totals(self):
-        values = {}
-        for sample, segment, _, fraction, major, minor in self.records:
-            values.setdefault((sample, segment), []).append(fraction * (major + minor))
-        return {key: math.fsum(parts) for key, parts in values.items()}
-
-    @property
-    def state_counts(self):
-        counts = {}
-        for sample, segment, *_ in self.records:
-            key = sample, segment
-            counts[key] = counts.get(key, 0) + 1
-        return counts
-
-
 def _unique_json_object(pairs):
     result = {}
     for key, value in pairs:
@@ -134,22 +118,3 @@ def _parse_segment_cn_states_json(value, sample_id, segment_id):
                             "cn_state_fraction, major_cn and minor_cn for every state.")
     return SegmentCNStates(tuple(dict(sample_id=sample_id, segment_id=segment_id, **state)
                                  for state in states))
-
-
-def segment_states_from_catalog(catalog):
-    """Extract one state list per segment from an already validated catalog."""
-    segments, explicit = {}, False
-    for source in catalog.source_rows:
-        row = dict(source)
-        key = row["sample_id"], row["segment_id"]
-        if key in segments:
-            continue
-        parsed = parse_segment_cn_states(row.get("segment_cn_states"), sample_id=key[0], segment_id=key[1])
-        explicit |= parsed is not None
-        segments[key] = (parsed.records if parsed is not None else
-            ((*key, "0", 1., int(float(row["allele_a_cn"])), int(float(row["allele_b_cn"]))),))
-    return SegmentCNStates(tuple(row for rows in segments.values() for row in rows)) if explicit else None
-
-
-__all__ = ["CN_STATE_COLUMNS", "CN_STATE_FRACTION_ATOL", "SegmentCNStates",
-           "parse_segment_cn_states", "segment_states_from_catalog"]
